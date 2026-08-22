@@ -24,11 +24,6 @@ Special commands start with **`/`**. Short forms: `/t` todo, `/c` clipboard, `/s
 
 **Alt+Space** opens Katana. **Esc** in a tool returns home; **Esc** on home hides. Todo: `+` add, Enter edit, `%` progress, **Alt+V** done. `/todo showall` includes completed.
 
-## Run
+## Download
 
-```
-katana              # tray + hotkey
-katana todo add "…" # same todo store as the prompt
-```
-
-Config: `%APPDATA%\Katana`.
+**[Katana 0.1.0 for Windows](https://github.com/rajmenon/katana/releases/latest)** —
