@@ -1,0 +1,34 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/katana-core",
+    "crates/katana-todo",
+    "crates/katana-index",
+    "crates/katana-clip",
+    "crates/katana-shot",
+    "crates/katana",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+rust-version = "1.80"
+
+[workspace.dependencies]
+nucleo-matcher = "0.3"
+rusqlite = { version = "0.32", features = ["bundled"] }
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = true
+opt-level = "z"
+
+[profile.release-fast]
+inherits = "release"
+opt-level = 3

@@ -1,0 +1,13 @@
+[package]
+name = "katana-index"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+katana-core = { path = "../katana-core" }
+thiserror.workspace = true
+regex = { version = "1", default-features = false, features = ["std", "unicode-case"] }
+
+[target.'cfg(windows)'.dependencies]
+usn-journal-rs = "0.4"
