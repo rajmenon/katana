@@ -26,4 +26,15 @@ Special commands start with **`/`**. Short forms: `/t` todo, `/c` clipboard, `/s
 
 ## Download
 
-**[Katana 0.1.0 for Windows](https://github.com/rajmenon/katana/releases/latest)** —
+**[Katana 0.1.0 for Windows](https://github.com/rajmenon/katana/releases/latest)** — `Katana-0.1.0-windows-x86_64.exe` (~2.4 MB). Run it; it stays in the tray. **Alt+Space** opens the prompt.
+
+## Run
+
+```
+katana              # tray + hotkey
+katana todo add "…" # same todo store as the prompt
+```
+
+From source: `cargo build --release -p katana`
+
+Config: `%APPDATA%\Katana`.
