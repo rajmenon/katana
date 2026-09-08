@@ -25,6 +25,12 @@ pub fn settings_path() -> PathBuf {
 pub struct Settings {
     #[serde(default = "default_hotkey")]
     pub hotkey: String,
+    /// Global hotkey that opens `/clip`. Default Win+Alt+C.
+    #[serde(default = "default_clip_hotkey")]
+    pub clip_hotkey: String,
+    /// Global hotkey that opens `/f`. Default Win+Alt+Space.
+    #[serde(default = "default_files_hotkey")]
+    pub files_hotkey: String,
     #[serde(default)]
     pub autostart: bool,
     #[serde(default = "default_true")]
@@ -72,6 +78,49 @@ fn default_hotkey() -> String {
     "alt+space".into()
 }
 
+fn default_clip_hotkey() -> String {
+    "win+alt+c".into()
+}
+
+fn default_files_hotkey() -> String {
+    "win+alt+space".into()
+}
+
+pub const HK_ALT: u32 = 0x0001;
+pub const HK_CTRL: u32 = 0x0002;
+pub const HK_SHIFT: u32 = 0x0004;
+pub const HK_WIN: u32 = 0x0008;
+pub const HK_NOREPEAT: u32 = 0x4000;
+
+/// Parse `win+alt+c` / `alt+space` into (RegisterHotKey modifiers, virtual-key).
+pub fn parse_hotkey(s: &str) -> Option<(u32, u32)> {
+    let mut mods = 0u32;
+    let mut key: Option<u32> = None;
+    for part in s.split('+') {
+        let p = part.trim().to_ascii_lowercase();
+        if p.is_empty() {
+            continue;
+        }
+        match p.as_str() {
+            "alt" | "menu" => mods |= HK_ALT,
+            "ctrl" | "control" => mods |= HK_CTRL,
+            "shift" => mods |= HK_SHIFT,
+            "win" | "super" | "meta" | "windows" => mods |= HK_WIN,
+            "space" => key = Some(0x20),
+            "printscreen" | "prtsc" | "snapshot" => key = Some(0x2C),
+            one if one.len() == 1 => {
+                let c = one.chars().next()?.to_ascii_uppercase();
+                if c.is_ascii_alphanumeric() {
+                    key = Some(c as u32);
+                }
+            }
+            _ => return None,
+        }
+    }
+    let vk = key?;
+    Some((mods | HK_NOREPEAT, vk))
+}
+
 fn default_true() -> bool {
     true
 }
@@ -80,6 +129,8 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             hotkey: default_hotkey(),
+            clip_hotkey: default_clip_hotkey(),
+            files_hotkey: default_files_hotkey(),
             autostart: false,
             save_shots: true,
             crawl_folders: Vec::new(),
@@ -193,18 +244,64 @@ pub fn save_keywords(path: &Path, kws: &[Keyword]) -> Result<(), String> {
     fs::write(path, raw).map_err(|e| e.to_string())
 }
 
+pub fn folder_keywords() -> Vec<Keyword> {
+    crate::launcher::well_known_user_folders()
+        .into_iter()
+        .filter_map(|(label, path)| {
+            let aliases = match label.as_str() {
+                "Documents" => vec!["documents".into(), "mydocs".into()],
+                "Downloads" => vec!["downloads".into(), "dl".into()],
+                "Desktop" => vec!["desktop".into()],
+                "Pictures" => vec!["pictures".into(), "pics".into()],
+                "Videos" => vec!["videos".into()],
+                "Music" => vec!["music".into()],
+                "Home" => vec!["home".into()],
+                _ => return None,
+            };
+            Some(Keyword {
+                names: aliases,
+                url: None,
+                path: Some(path.to_string_lossy().into_owned()),
+                args: None,
+                steps: None,
+                command: None,
+            })
+        })
+        .collect()
+}
+
+pub fn merge_folder_keywords(kws: &mut Vec<Keyword>) -> bool {
+    let mut added = false;
+    for extra in folder_keywords() {
+        let clash = extra
+            .names
+            .iter()
+            .any(|n| kws.iter().any(|k| k.matches(n)));
+        if !clash {
+            kws.push(extra);
+            added = true;
+        }
+    }
+    added
+}
+
 pub fn ensure_keyword_file() -> Vec<Keyword> {
     let path = keywords_path();
     let legacy = data_dir().join("keywords.toml");
     if !path.exists() && legacy.exists() {
         let _ = fs::rename(&legacy, &path);
     }
-    if !path.exists() {
-        let kws = default_keywords();
+    let mut kws = if !path.exists() {
+        default_keywords()
+    } else {
+        load_keywords(&path)
+    };
+    if merge_folder_keywords(&mut kws) {
         let _ = save_keywords(&path, &kws);
-        return kws;
+    } else if !path.exists() {
+        let _ = save_keywords(&path, &kws);
     }
-    load_keywords(&path)
+    kws
 }
 
 #[cfg(windows)]
@@ -297,6 +394,8 @@ mod tests {
         let path = dir.join("config.toml");
         let s = Settings {
             hotkey: "alt+space".into(),
+            clip_hotkey: "win+alt+c".into(),
+            files_hotkey: "win+alt+space".into(),
             autostart: true,
             save_shots: true,
             crawl_folders: vec![r"C:\src".into()],
@@ -313,6 +412,8 @@ mod tests {
         let p = tmp("missing").join("nope.toml");
         assert!(!load_keywords(&p).is_empty());
         assert_eq!(Settings::load(&p).hotkey, "alt+space");
+        assert_eq!(Settings::load(&p).clip_hotkey, "win+alt+c");
+        assert_eq!(Settings::load(&p).files_hotkey, "win+alt+space");
         assert!(Settings::default().save_shots);
         assert_eq!(Settings::load(&p).clip_history_limit, 100);
     }
@@ -331,6 +432,40 @@ mod tests {
         fs::write(&path, "hotkey = \"alt+space\"\nclip_history_limit = 3\n").unwrap();
         assert_eq!(Settings::load(&path).clip_history_limit, 10);
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn merge_folder_keywords_adds_downloads() {
+        let mut kws = default_keywords();
+        let n = kws.len();
+        let _ = merge_folder_keywords(&mut kws);
+        if std::env::var("USERPROFILE").is_ok() {
+            assert!(kws.len() >= n);
+            assert!(
+                kws.iter().any(|k| k.matches("downloads") || k.matches("documents")),
+                "{:?}",
+                kws.iter().flat_map(|k| k.names.clone()).collect::<Vec<_>>()
+            );
+        }
+        let before = kws.len();
+        assert!(!merge_folder_keywords(&mut kws));
+        assert_eq!(kws.len(), before);
+    }
+
+    #[test]
+    fn parse_hotkey_win_alt_defaults() {
+        let (m, vk) = parse_hotkey("win+alt+c").unwrap();
+        assert_eq!(vk, b'C' as u32);
+        assert_eq!(m & HK_WIN, HK_WIN);
+        assert_eq!(m & HK_ALT, HK_ALT);
+        let (m2, vk2) = parse_hotkey("win+alt+space").unwrap();
+        assert_eq!(vk2, 0x20);
+        assert_eq!(m2 & HK_WIN, HK_WIN);
+        let (m3, vk3) = parse_hotkey("alt+space").unwrap();
+        assert_eq!(vk3, 0x20);
+        assert_eq!(m3 & HK_ALT, HK_ALT);
+        assert_eq!(m3 & HK_WIN, 0);
+        assert!(parse_hotkey("nope").is_none());
     }
 
     #[test]

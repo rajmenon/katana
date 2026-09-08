@@ -22,6 +22,10 @@ pub enum Outcome {
     Listed(Vec<Hit>),
     NeedCapture(ShotMode),
     OpenStudio(&'static str),
+    /// Clipboard already set; UI restores the previous window and sends Ctrl+V.
+    Paste,
+    /// Shell command finished with a non-zero exit (overlay should blink).
+    CmdFailed { exit: i32, cmdline: String },
 }
 
 #[derive(Debug, Clone)]
@@ -42,6 +46,11 @@ pub struct Launcher {
     pub dry_run: bool,
     pub clip_history_limit: usize,
     pub todo_input: Option<TodoInput>,
+    pub file_sort: crate::search::FileSort,
+    pub file_sort_desc: bool,
+    pub file_scroll: usize,
+    /// Char index in the editable prompt (query, or todo compose buffer).
+    pub caret: usize,
     clip_preview: Option<(i64, u32, u32, Vec<u8>)>,
 }
 
@@ -66,6 +75,10 @@ impl Launcher {
             dry_run,
             clip_history_limit: 100,
             todo_input: None,
+            file_sort: crate::search::FileSort::Score,
+            file_sort_desc: false,
+            file_scroll: 0,
+            caret: 0,
             clip_preview: None,
         })
     }
@@ -95,19 +108,184 @@ impl Launcher {
             dry_run,
             clip_history_limit,
             todo_input: None,
+            file_sort: crate::search::FileSort::Score,
+            file_sort_desc: false,
+            file_scroll: 0,
+            caret: 0,
             clip_preview: None,
         })
     }
 
+    fn search_limit(&self, raw: &str) -> usize {
+        if crate::search::is_file_blade(raw) {
+            crate::search::FILE_SEARCH_LIMIT
+        } else {
+            24
+        }
+    }
+
     pub fn set_query(&mut self, raw: &str) -> Vec<Hit> {
+        self.set_query_keep_caret(raw, raw.chars().count())
+    }
+
+    pub fn set_query_keep_caret(&mut self, raw: &str, caret: usize) -> Vec<Hit> {
         self.todo_input = None;
         self.query = raw.to_string();
-        let (_, hits) = self
-            .engine
-            .search(raw, Some(&self.todos), Some(&self.clips), 24);
+        self.caret = crate::search::clamp_caret(self.query.chars().count(), caret);
+        let limit = self.search_limit(raw);
+        let hits = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.engine
+                .search(raw, Some(&self.todos), Some(&self.clips), limit)
+                .1
+        }))
+        .unwrap_or_default();
         self.hits = hits;
         self.selected = 0;
+        self.file_scroll = 0;
+        self.apply_file_sort();
+        self.ensure_file_scroll();
         self.hits.clone()
+    }
+
+    fn apply_file_sort(&mut self) {
+        if !crate::search::is_file_blade(&self.query) {
+            return;
+        }
+        if self.file_sort == crate::search::FileSort::Score && !self.file_sort_desc {
+            return;
+        }
+        crate::search::sort_file_hits(&mut self.hits, self.file_sort, self.file_sort_desc);
+    }
+
+    pub fn cycle_file_sort(&mut self, col: crate::search::FileSort) {
+        if self.file_sort == col {
+            self.file_sort_desc = !self.file_sort_desc;
+        } else {
+            self.file_sort = col;
+            self.file_sort_desc = matches!(
+                col,
+                crate::search::FileSort::Modified | crate::search::FileSort::Size
+            );
+        }
+        self.apply_file_sort();
+        self.selected = 0;
+        self.file_scroll = 0;
+        self.ensure_file_scroll();
+    }
+
+    pub fn ensure_file_scroll(&mut self) {
+        if !crate::search::is_file_blade(&self.query) {
+            self.file_scroll = 0;
+            return;
+        }
+        self.file_scroll = crate::search::file_scroll_keep_visible(
+            self.hits.len(),
+            crate::search::FILE_PAGE,
+            self.selected,
+            self.file_scroll,
+        );
+    }
+
+    pub fn scroll_files_by(&mut self, delta: i32) {
+        if !crate::search::is_file_blade(&self.query) {
+            return;
+        }
+        let vis = crate::search::FILE_PAGE;
+        let max_scroll = self.hits.len().saturating_sub(vis);
+        if delta < 0 {
+            self.file_scroll = self.file_scroll.saturating_sub((-delta) as usize);
+        } else {
+            self.file_scroll = (self.file_scroll + delta as usize).min(max_scroll);
+        }
+        if self.selected < self.file_scroll {
+            self.selected = self.file_scroll;
+        }
+        let last_vis = self.file_scroll + vis.saturating_sub(1);
+        if self.selected > last_vis && last_vis < self.hits.len() {
+            self.selected = last_vis.min(self.hits.len().saturating_sub(1));
+        }
+    }
+
+    pub fn page_files(&mut self, down: bool) {
+        let vis = crate::search::FILE_PAGE;
+        if down {
+            self.selected = (self.selected + vis).min(self.hits.len().saturating_sub(1));
+        } else {
+            self.selected = self.selected.saturating_sub(vis);
+        }
+        self.ensure_file_scroll();
+    }
+
+    fn edit_buf(&self) -> String {
+        match &self.todo_input {
+            Some(TodoInput::Add { buf } | TodoInput::Edit { buf, .. } | TodoInput::Progress { buf, .. }) => {
+                buf.clone()
+            }
+            None => self.query.clone(),
+        }
+    }
+
+    fn write_edit_buf(&mut self, s: String, caret: usize) {
+        let n = s.chars().count();
+        self.caret = crate::search::clamp_caret(n, caret);
+        match &mut self.todo_input {
+            Some(TodoInput::Add { buf } | TodoInput::Edit { buf, .. } | TodoInput::Progress { buf, .. }) => {
+                *buf = s;
+            }
+            None => {
+                self.set_query_keep_caret(&s, self.caret);
+            }
+        }
+    }
+
+    pub fn insert_at_caret(&mut self, ch: char) {
+        let (s, c) = crate::search::insert_at(&self.edit_buf(), self.caret, ch);
+        self.write_edit_buf(s, c);
+    }
+
+    pub fn backspace_at_caret(&mut self) {
+        let (s, c) = crate::search::backspace_at(&self.edit_buf(), self.caret);
+        self.write_edit_buf(s, c);
+    }
+
+    pub fn delete_at_caret(&mut self) {
+        let (s, c) = crate::search::delete_at(&self.edit_buf(), self.caret);
+        self.write_edit_buf(s, c);
+    }
+
+    pub fn move_caret(&mut self, delta: i32) {
+        let n = self.edit_buf().chars().count();
+        self.caret = crate::search::move_caret(n, self.caret, delta);
+    }
+
+    pub fn caret_home(&mut self) {
+        self.caret = 0;
+    }
+
+    pub fn caret_end(&mut self) {
+        self.caret = self.edit_buf().chars().count();
+    }
+
+    /// Char index in `prompt_text()` where the caret is drawn.
+    pub fn prompt_caret_index(&self) -> usize {
+        let prefix = match &self.todo_input {
+            Some(TodoInput::Add { .. }) => 2,
+            Some(TodoInput::Edit { .. }) => 6,
+            Some(TodoInput::Progress { .. }) => 2,
+            None => 0,
+        };
+        prefix + self.caret
+    }
+
+    pub fn set_prompt_caret(&mut self, prompt_index: usize) {
+        let prefix = match &self.todo_input {
+            Some(TodoInput::Add { .. }) => 2,
+            Some(TodoInput::Edit { .. }) => 6,
+            Some(TodoInput::Progress { .. }) => 2,
+            None => 0,
+        };
+        let n = self.edit_buf().chars().count();
+        self.caret = prompt_index.saturating_sub(prefix).min(n);
     }
 
     pub fn execute_query(&mut self, raw: &str) -> Result<Outcome, String> {
@@ -155,10 +333,12 @@ impl Launcher {
             Route::Settings => Ok(Outcome::OpenStudio("settings")),
             Route::EditKeywords => Ok(Outcome::OpenStudio("shortcuts")),
             Route::EditTodos => Ok(Outcome::OpenStudio("todos")),
+            Route::KeepAwake => self.toggle_awake(),
             Route::Clip { query } if crate::search::is_clip_clear_cmd(&query) => {
                 self.clear_clips()
             }
             Route::Shortcuts { .. }
+            | Route::Launch { .. }
             | Route::Clip { .. }
             | Route::Files { .. }
             | Route::Apps { .. }
@@ -183,8 +363,13 @@ impl Launcher {
             if cmd == "/settings" {
                 return Ok(Outcome::OpenStudio("settings"));
             }
-            let q = if cmd == "/cmd" {
-                "/cmd ".to_string()
+            if cmd == "/awake" {
+                return self.toggle_awake();
+            }
+            let q = if cmd == "/f" {
+                "/f ".to_string()
+            } else if matches!(cmd, "/k" | "/cmd" | "/apps" | "/a" | "/go") {
+                "/k ".to_string()
             } else {
                 cmd.to_string()
             };
@@ -320,7 +505,7 @@ impl Launcher {
             .id
             .strip_prefix("clip:")
             .and_then(|s| s.parse::<i64>().ok());
-        if hit.subtitle.contains("image") {
+        if crate::search::clip_hit_is_image(hit) {
             if let Some(id) = id {
                 if let Ok(Some(png)) = self.clips.get_image(id) {
                     if let Ok((w, h, bgra)) = katana_shot::png_to_bgra(&png) {
@@ -328,12 +513,12 @@ impl Launcher {
                             let _ = crate::capture::set_clipboard_png_dib(&png, &dib);
                         }
                     }
-                    return Ok(Outcome::Copied("image".into()));
+                    return Ok(Outcome::Paste);
                 }
             }
         }
         let _ = crate::capture::set_clipboard_text(&hit.title);
-        Ok(Outcome::Copied(hit.title.clone()))
+        Ok(Outcome::Paste)
     }
 
     pub fn clear_clips(&mut self) -> Result<Outcome, String> {
@@ -372,8 +557,29 @@ impl Launcher {
         Ok(Outcome::Listed(self.hits.clone()))
     }
 
+    fn toggle_awake(&mut self) -> Result<Outcome, String> {
+        crate::keepawake::toggle();
+        self.set_query("");
+        Ok(Outcome::Listed(self.hits.clone()))
+    }
+
     pub fn go_home(&mut self) {
         self.set_query("");
+    }
+
+    /// Step toward home. `true` = caller should hide the overlay.
+    pub fn go_back(&mut self) -> bool {
+        if self.composing() {
+            self.cancel_todo_input();
+            return false;
+        }
+        match crate::search::parent_query(&self.query) {
+            None => true,
+            Some(q) => {
+                self.set_query(&q);
+                false
+            }
+        }
     }
 
     pub fn prompt_text(&self) -> String {
@@ -414,6 +620,7 @@ impl Launcher {
 
     pub fn begin_todo_add(&mut self) {
         self.todo_input = Some(TodoInput::Add { buf: String::new() });
+        self.caret = 0;
     }
 
     pub fn begin_todo_edit(&mut self) {
@@ -425,6 +632,7 @@ impl Launcher {
             .get(self.selected)
             .map(|h| h.title.clone())
             .unwrap_or_default();
+        self.caret = title.chars().count();
         self.todo_input = Some(TodoInput::Edit { id, buf: title });
     }
 
@@ -436,6 +644,7 @@ impl Launcher {
             id,
             buf: String::new(),
         });
+        self.caret = 0;
     }
 
     pub fn cancel_todo_input(&mut self) {
@@ -550,7 +759,18 @@ impl Launcher {
         if self.dry_run {
             return Ok(Outcome::Ran(format!("{action:?}")));
         }
-        Ok(Outcome::Ran(perform(action)?))
+        match action {
+            ResolvedAction::Shell { cmdline, admin } => {
+                match crate::exec::run_shell(cmdline, *admin) {
+                    Ok(()) => Ok(Outcome::Ran(format!("shell {cmdline}"))),
+                    Err(exit) => Ok(Outcome::CmdFailed {
+                        exit,
+                        cmdline: cmdline.clone(),
+                    }),
+                }
+            }
+            other => Ok(Outcome::Ran(perform(other)?)),
+        }
     }
 
     pub fn ingest_clipboard_text(&mut self, text: &str) -> Result<Option<i64>, String> {
@@ -577,7 +797,10 @@ impl Launcher {
         rect: PhysRect,
         bgra: &[u8],
     ) -> Result<Outcome, String> {
-        if matches!(mode, ShotMode::Region | ShotMode::Window | ShotMode::Screen) {
+        if matches!(
+            mode,
+            ShotMode::Region | ShotMode::Window | ShotMode::Screen | ShotMode::Browser
+        ) {
             self.last_region = Some(rect);
         }
         let w = rect.w.max(0) as u32;
@@ -618,14 +841,77 @@ fn fit_thumb(w: u32, h: u32, max_w: u32, max_h: u32) -> (u32, u32) {
 }
 
 pub fn default_user_roots() -> Vec<std::path::PathBuf> {
-    let mut roots = Vec::new();
-    if let Ok(u) = std::env::var("USERPROFILE") {
-        roots.push(std::path::PathBuf::from(&u).join("Documents"));
-        roots.push(std::path::PathBuf::from(&u).join("Desktop"));
-        roots.push(std::path::PathBuf::from(&u).join("Downloads"));
-        roots.push(std::path::PathBuf::from(&u).join("src"));
+    well_known_user_folders()
+        .into_iter()
+        .map(|(_, p)| p)
+        .collect()
+}
+
+/// Known profile folders so `/f` can open Documents, Downloads, etc.
+pub fn well_known_user_folders() -> Vec<(String, std::path::PathBuf)> {
+    let mut out = Vec::new();
+    let Ok(u) = std::env::var("USERPROFILE") else {
+        return out;
+    };
+    let home = std::path::PathBuf::from(&u);
+    let names = [
+        ("Documents", "Documents"),
+        ("Downloads", "Downloads"),
+        ("Desktop", "Desktop"),
+        ("Pictures", "Pictures"),
+        ("Videos", "Videos"),
+        ("Music", "Music"),
+        ("src", "src"),
+    ];
+    out.push(("Home".into(), home.clone()));
+    for (label, sub) in names {
+        out.push((label.into(), home.join(sub)));
     }
-    roots
+    out.retain(|(_, p)| p.is_dir());
+    out
+}
+
+pub fn well_known_folder_hits() -> Vec<Hit> {
+    well_known_user_folders()
+        .into_iter()
+        .map(|(name, path)| folder_hit(&name, &path, 1.0))
+        .collect()
+}
+
+pub fn matching_folder_hits(query: &str) -> Vec<Hit> {
+    let q = query.trim().to_ascii_lowercase();
+    if q.is_empty() {
+        return well_known_folder_hits();
+    }
+    well_known_user_folders()
+        .into_iter()
+        .filter_map(|(name, path)| {
+            let nl = name.to_ascii_lowercase();
+            let score = if nl == q {
+                1.0
+            } else if nl.starts_with(&q) {
+                0.97
+            } else if nl.contains(&q) {
+                0.8
+            } else {
+                return None;
+            };
+            Some(folder_hit(&name, &path, score))
+        })
+        .collect()
+}
+
+fn folder_hit(name: &str, path: &std::path::Path, score: f32) -> Hit {
+    let mut h = Hit::new(
+        format!("file:{}", path.display()),
+        name.to_string(),
+        path.display().to_string(),
+        score,
+        katana_core::HitKind::File,
+    );
+    h.type_name = Some("File folder".into());
+    h.is_dir = true;
+    h
 }
 
 pub fn crawl_roots() -> Vec<std::path::PathBuf> {
@@ -644,7 +930,12 @@ pub fn crawl_roots() -> Vec<std::path::PathBuf> {
 }
 
 pub fn rebuild_file_index() -> katana_index::NameIndex {
-    katana_index::walk_roots(&crawl_roots())
+    let roots = crawl_roots();
+    let mut idx = katana_index::build_live_index(&roots);
+    for (name, path) in well_known_user_folders() {
+        idx.insert_full(&name, &path.to_string_lossy(), None, true);
+    }
+    idx
 }
 
 /// Heavy work: crawl folders + Start Menu. Call off the UI thread.
@@ -798,6 +1089,25 @@ mod tests {
     }
 
     #[test]
+    fn go_back_steps_through_blade_then_home() {
+        let mut l = launch();
+        l.set_query("/clip secret");
+        assert!(!l.go_back());
+        assert_eq!(l.query, "/clip");
+        assert!(!l.go_back());
+        assert!(l.query.is_empty());
+        assert!(l.go_back(), "home Esc hides");
+        l.set_query("/todo showall");
+        assert!(!l.go_back());
+        assert_eq!(l.query, "/todo");
+        l.begin_todo_add();
+        assert!(l.composing());
+        assert!(!l.go_back());
+        assert!(!l.composing());
+        assert_eq!(l.query, "/todo");
+    }
+
+    #[test]
     fn clip_clear_wipes_history() {
         let mut l = launch();
         assert!(l.ingest_clipboard_text("alpha").unwrap().is_some());
@@ -812,6 +1122,39 @@ mod tests {
             l.hits
         );
         assert!(l.hits.iter().any(|h| h.id == "clip:clear"));
+    }
+
+    #[test]
+    fn clip_enter_dry_run_copies_payload() {
+        let mut l = launch();
+        l.ingest_clipboard_text("paste-me").unwrap();
+        l.set_query("/clip");
+        l.selected = l
+            .hits
+            .iter()
+            .position(|h| h.title.contains("paste-me"))
+            .unwrap();
+        match l.execute_current().unwrap() {
+            Outcome::Copied(s) => assert!(s.contains("paste-me"), "{s}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn shot_short_commands_need_capture() {
+        let mut l = launch();
+        match l.execute_query("/sr").unwrap() {
+            Outcome::NeedCapture(ShotMode::Region) => {}
+            other => panic!("{other:?}"),
+        }
+        match l.execute_query("/sw").unwrap() {
+            Outcome::NeedCapture(ShotMode::Window) => {}
+            other => panic!("{other:?}"),
+        }
+        match l.execute_query("/sf").unwrap() {
+            Outcome::NeedCapture(ShotMode::Browser) => {}
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]
@@ -881,6 +1224,80 @@ mod tests {
         );
         match l.execute_current().unwrap() {
             Outcome::Ran(s) => assert!(s.contains("invoice.pdf"), "{s}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn awake_command_toggles_session_flag() {
+        let mut l = launch();
+        let start = crate::keepawake::is_on();
+        match l.execute_query("/awake").unwrap() {
+            Outcome::Listed(hits) => {
+                assert!(
+                    hits.iter().any(|h| h.id == "cmd:/awake"),
+                    "{:?}",
+                    hits.iter().map(|h| &h.id).collect::<Vec<_>>()
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_ne!(crate::keepawake::is_on(), start);
+        crate::keepawake::set(start);
+    }
+
+    #[test]
+    fn file_hotkey_query_has_trailing_space_and_sorts() {
+        let mut l = launch();
+        l.engine.files.insert_full("zeta.bin", r"C:\docs\zeta.bin", Some(9000), false);
+        l.engine.files.insert_full("alpha.bin", r"C:\docs\alpha.bin", Some(50), false);
+        l.set_query("/f ");
+        assert_eq!(l.query, "/f ");
+        l.set_query("/f *.bin");
+        l.cycle_file_sort(crate::search::FileSort::Name);
+        assert_eq!(l.hits[0].title, "alpha.bin");
+        l.cycle_file_sort(crate::search::FileSort::Name);
+        assert_eq!(l.hits[0].title, "zeta.bin");
+        l.cycle_file_sort(crate::search::FileSort::Size);
+        assert_eq!(l.hits[0].title, "zeta.bin", "size defaults to largest first");
+    }
+
+    #[test]
+    fn caret_edits_middle_of_file_query_and_scrolls() {
+        let mut l = launch();
+        l.set_query("/f hello");
+        assert_eq!(l.caret, 8);
+        l.move_caret(-5);
+        assert_eq!(l.caret, 3);
+        l.insert_at_caret('X');
+        assert_eq!(l.query, "/f Xhello");
+        l.backspace_at_caret();
+        assert_eq!(l.query, "/f hello");
+        l.caret_home();
+        l.delete_at_caret();
+        assert_eq!(l.query, "f hello");
+        for i in 0..30 {
+            l.engine.files.insert_full(
+                &format!("item{i:02}.txt"),
+                &format!(r"C:\docs\item{i:02}.txt"),
+                Some(i as u64),
+                false,
+            );
+        }
+        l.set_query("/f item");
+        assert!(l.hits.len() > crate::search::FILE_PAGE);
+        l.selected = 12;
+        l.ensure_file_scroll();
+        assert_eq!(l.file_scroll, 12 + 1 - crate::search::FILE_PAGE);
+        l.scroll_files_by(-2);
+        assert!(l.file_scroll < 5);
+    }
+
+    #[test]
+    fn dry_run_shell_does_not_fail() {
+        let mut l = launch();
+        match l.execute_query("> exit 1").unwrap() {
+            Outcome::Ran(s) => assert!(s.contains("exit 1") || s.contains("Shell"), "{s}"),
             other => panic!("{other:?}"),
         }
     }

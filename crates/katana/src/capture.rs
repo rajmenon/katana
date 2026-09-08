@@ -16,6 +16,7 @@ pub fn capture(mode: ShotMode, last: Option<PhysRect>) -> Result<Frame, String> 
         ShotMode::Region | ShotMode::Delay { .. } => select_and_capture_region(),
         ShotMode::Window => capture_foreground_window(),
         ShotMode::Screen => capture_virtual_screen(),
+        ShotMode::Browser => capture_browser_or_window(),
         ShotMode::Last => {
             let r = last.ok_or_else(|| "no last region".to_string())?;
             capture_rect(r)
@@ -25,6 +26,11 @@ pub fn capture(mode: ShotMode, last: Option<PhysRect>) -> Result<Frame, String> 
 
 #[cfg(not(windows))]
 pub fn capture(_mode: ShotMode, _last: Option<PhysRect>) -> Result<Frame, String> {
+    Err("capture is Windows-only".into())
+}
+
+#[cfg(not(windows))]
+pub fn capture_browser_or_window() -> Result<Frame, String> {
     Err("capture is Windows-only".into())
 }
 
@@ -71,6 +77,322 @@ pub fn capture_foreground_window() -> Result<Frame, String> {
         };
         bitblt_rect(r)
     }
+}
+
+#[cfg(windows)]
+pub fn capture_browser_or_window() -> Result<Frame, String> {
+    use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        if hwnd.0.is_null() {
+            return Err("no foreground window".into());
+        }
+        if is_browser_hwnd(hwnd) {
+            capture_scrolling_window(hwnd).or_else(|_| capture_window_hwnd(hwnd))
+        } else {
+            capture_window_hwnd(hwnd)
+        }
+    }
+}
+
+#[cfg(windows)]
+fn window_class_and_title(hwnd: windows::Win32::Foundation::HWND) -> (String, String) {
+    use windows::Win32::UI::WindowsAndMessaging::{GetClassNameW, GetWindowTextW};
+    unsafe {
+        let mut cls = [0u16; 256];
+        let n = GetClassNameW(hwnd, &mut cls);
+        let class = String::from_utf16_lossy(&cls[..n as usize]);
+        let mut title = [0u16; 512];
+        let t = GetWindowTextW(hwnd, &mut title);
+        let title = String::from_utf16_lossy(&title[..t as usize]);
+        (class, title)
+    }
+}
+
+#[cfg(windows)]
+pub fn is_browser_hwnd(hwnd: windows::Win32::Foundation::HWND) -> bool {
+    let (class, title) = window_class_and_title(hwnd);
+    let c = class.to_ascii_lowercase();
+    let t = title.to_ascii_lowercase();
+    c.contains("chrome_widgetwin")
+        || c.contains("mozillawindowclass")
+        || c.contains("operawindow")
+        || c.contains("vivaldi")
+        || ((c.contains("applicationframewindow") || c.contains("cabinetwclass"))
+            && (t.contains("edge") || t.contains("chrome") || t.contains("firefox")))
+}
+
+#[cfg(windows)]
+pub fn capture_window_hwnd(hwnd: windows::Win32::Foundation::HWND) -> Result<Frame, String> {
+    use windows::Win32::Foundation::RECT;
+    use windows::Win32::Graphics::Gdi::{
+        BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC,
+        ReleaseDC, SelectObject, SRCCOPY,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
+    unsafe {
+        let mut rc = RECT::default();
+        GetWindowRect(hwnd, &mut rc).map_err(|e| e.to_string())?;
+        let r = PhysRect {
+            x: rc.left,
+            y: rc.top,
+            w: rc.right - rc.left,
+            h: rc.bottom - rc.top,
+            dpi: 96,
+        };
+        if r.w <= 0 || r.h <= 0 {
+            return Err("empty window".into());
+        }
+        let hdc_scr = GetDC(hwnd);
+        if hdc_scr.0.is_null() {
+            return Err("GetDC failed".into());
+        }
+        let hdc_mem = CreateCompatibleDC(hdc_scr);
+        let hbmp = CreateCompatibleBitmap(hdc_scr, r.w, r.h);
+        let old = SelectObject(hdc_mem, hbmp);
+        type PrintWindowFn = unsafe extern "system" fn(
+            windows::Win32::Foundation::HWND,
+            windows::Win32::Graphics::Gdi::HDC,
+            u32,
+        ) -> i32;
+        let mut printed = false;
+        if let Ok(lib) = windows::Win32::System::LibraryLoader::GetModuleHandleW(windows::core::w!(
+            "user32.dll"
+        )) {
+            if let Some(f) =
+                windows::Win32::System::LibraryLoader::GetProcAddress(lib, windows::core::s!("PrintWindow"))
+            {
+                let f: PrintWindowFn = std::mem::transmute(f);
+                printed = f(hwnd, hdc_mem, 2) != 0; // PW_RENDERFULLCONTENT
+            }
+        }
+        if !printed {
+            let desk = GetDC(windows::Win32::Foundation::HWND(std::ptr::null_mut()));
+            let _ = BitBlt(hdc_mem, 0, 0, r.w, r.h, desk, r.x, r.y, SRCCOPY);
+            ReleaseDC(windows::Win32::Foundation::HWND(std::ptr::null_mut()), desk);
+        }
+        let bgra = read_dib_section(hdc_mem, hbmp, r.w, r.h)?;
+        SelectObject(hdc_mem, old);
+        let _ = DeleteObject(hbmp);
+        let _ = DeleteDC(hdc_mem);
+        ReleaseDC(hwnd, hdc_scr);
+        Ok(Frame { rect: r, bgra })
+    }
+}
+
+#[cfg(windows)]
+fn client_phys(hwnd: windows::Win32::Foundation::HWND) -> Result<PhysRect, String> {
+    use windows::Win32::Foundation::{POINT, RECT};
+    use windows::Win32::Graphics::Gdi::ClientToScreen;
+    use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
+    unsafe {
+        let mut rc = RECT::default();
+        GetClientRect(hwnd, &mut rc).map_err(|e| e.to_string())?;
+        let mut pt = POINT {
+            x: rc.left,
+            y: rc.top,
+        };
+        let _ = ClientToScreen(hwnd, &mut pt);
+        Ok(PhysRect {
+            x: pt.x,
+            y: pt.y,
+            w: rc.right - rc.left,
+            h: rc.bottom - rc.top,
+            dpi: 96,
+        })
+    }
+}
+
+#[cfg(windows)]
+fn hash_tail(bgra: &[u8], w: i32, h: i32, rows: i32) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let rows = rows.min(h).max(1) as usize;
+    let w = w.max(1) as usize;
+    let h = h.max(1) as usize;
+    let stride = w * 4;
+    let start = h.saturating_sub(rows) * stride;
+    let mut hasher = DefaultHasher::new();
+    bgra.get(start..).unwrap_or(bgra).hash(&mut hasher);
+    hasher.finish()
+}
+
+#[cfg(windows)]
+fn send_wheel(delta: i32) {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_WHEEL, MOUSEINPUT,
+    };
+    unsafe {
+        let input = INPUT {
+            r#type: INPUT_MOUSE,
+            Anonymous: INPUT_0 {
+                mi: MOUSEINPUT {
+                    dx: 0,
+                    dy: 0,
+                    mouseData: delta as u32,
+                    dwFlags: MOUSEEVENTF_WHEEL,
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        };
+        let _ = SendInput(&[input], std::mem::size_of::<INPUT>() as i32);
+    }
+}
+
+#[cfg(windows)]
+fn capture_scrolling_window(hwnd: windows::Win32::Foundation::HWND) -> Result<Frame, String> {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SetForegroundWindow, ShowWindow, SW_RESTORE, WM_VSCROLL,
+    };
+    unsafe {
+        let _ = ShowWindow(hwnd, SW_RESTORE);
+        let _ = SetForegroundWindow(hwnd);
+        // SB_TOP = 6
+        let _ = windows::Win32::UI::WindowsAndMessaging::SendMessageW(
+            hwnd,
+            WM_VSCROLL,
+            windows::Win32::Foundation::WPARAM(6),
+            windows::Win32::Foundation::LPARAM(0),
+        );
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        let r = client_phys(hwnd)?;
+        if r.w < 8 || r.h < 8 {
+            return Err("client too small".into());
+        }
+        let mut slices: Vec<(u32, Vec<u8>)> = Vec::new();
+        let mut last_hash = 0u64;
+        let mut same = 0u32;
+        for i in 0..12 {
+            let frame = capture_rect(r)?;
+            let hsh = hash_tail(&frame.bgra, r.w, r.h, 20);
+            if i > 0 && hsh == last_hash {
+                same += 1;
+                if same >= 2 {
+                    break;
+                }
+            } else {
+                same = 0;
+            }
+            last_hash = hsh;
+            slices.push((frame.rect.h as u32, frame.bgra));
+            send_wheel(-360);
+            std::thread::sleep(std::time::Duration::from_millis(90));
+        }
+        if slices.is_empty() {
+            return Err("no slices".into());
+        }
+        let refs: Vec<(u32, &[u8])> = slices.iter().map(|(h, b)| (*h, b.as_slice())).collect();
+        let (w, h, bgra) = katana_shot::stitch_vertical_bgra(r.w as u32, &refs)?;
+        Ok(Frame {
+            rect: PhysRect {
+                x: r.x,
+                y: r.y,
+                w: w as i32,
+                h: h as i32,
+                dpi: 96,
+            },
+            bgra,
+        })
+    }
+}
+
+/// Restore the previous window + focused control, then insert clipboard (WM_PASTE and Ctrl+V).
+#[cfg(windows)]
+pub fn paste_into_hwnd(
+    window: windows::Win32::Foundation::HWND,
+    focus: windows::Win32::Foundation::HWND,
+) -> Result<(), String> {
+    use windows::Win32::Foundation::{LPARAM, WPARAM};
+    use windows::Win32::System::Threading::GetCurrentThreadId;
+    use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        MapVirtualKeyW, SendInput, SetFocus, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT,
+        KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MAPVK_VK_TO_VSC, VIRTUAL_KEY, VK_CONTROL, VK_MENU,
+        VK_SHIFT,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{
+        BringWindowToTop, GetWindowThreadProcessId, SendMessageW, SetForegroundWindow,
+    };
+    const VK_LWIN: VIRTUAL_KEY = VIRTUAL_KEY(0x5B);
+    const VK_RWIN: VIRTUAL_KEY = VIRTUAL_KEY(0x5C);
+    const VK_V: VIRTUAL_KEY = VIRTUAL_KEY(0x56);
+    const WM_PASTE: u32 = 0x0302;
+    unsafe fn key(vk: VIRTUAL_KEY, up: bool) -> INPUT {
+        let scan = MapVirtualKeyW(vk.0 as u32, MAPVK_VK_TO_VSC) as u16;
+        let mut flags = KEYEVENTF_SCANCODE;
+        if up {
+            flags |= KEYEVENTF_KEYUP;
+        }
+        INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: vk,
+                    wScan: scan,
+                    dwFlags: flags,
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        }
+    }
+    unsafe {
+        let target = if !window.0.is_null() {
+            window
+        } else {
+            focus
+        };
+        if target.0.is_null() {
+            return Err("no target window".into());
+        }
+        let field = if !focus.0.is_null() { focus } else { target };
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        let our = GetCurrentThreadId();
+        let tid = GetWindowThreadProcessId(target, None);
+        type AttachFn = unsafe extern "system" fn(u32, u32, i32) -> i32;
+        let attach: Option<AttachFn> = GetModuleHandleW(windows::core::w!("user32.dll"))
+            .ok()
+            .and_then(|lib| GetProcAddress(lib, windows::core::s!("AttachThreadInput")))
+            .map(|f| std::mem::transmute(f));
+        let attached = tid != 0
+            && tid != our
+            && attach.map(|f| f(our, tid, 1) != 0).unwrap_or(false);
+        let _ = BringWindowToTop(target);
+        let _ = SetForegroundWindow(target);
+        let _ = SetFocus(field);
+        std::thread::sleep(std::time::Duration::from_millis(40));
+        let _ = SendMessageW(field, WM_PASTE, WPARAM(0), LPARAM(0));
+        let ups = [
+            key(VK_MENU, true),
+            key(VK_SHIFT, true),
+            key(VK_CONTROL, true),
+            key(VK_LWIN, true),
+            key(VK_RWIN, true),
+        ];
+        let _ = SendInput(&ups, std::mem::size_of::<INPUT>() as i32);
+        let seq = [
+            key(VK_CONTROL, false),
+            key(VK_V, false),
+            key(VK_V, true),
+            key(VK_CONTROL, true),
+        ];
+        let n = SendInput(&seq, std::mem::size_of::<INPUT>() as i32);
+        if attached {
+            if let Some(f) = attach {
+                let _ = f(our, tid, 0);
+            }
+        }
+        if n == 0 {
+            return Err("SendInput failed".into());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+pub fn paste_into_hwnd(_window: isize, _focus: isize) -> Result<(), String> {
+    Err("paste is Windows-only".into())
 }
 
 #[cfg(windows)]
@@ -145,7 +467,7 @@ pub enum ClipPayload {
 pub fn pick_clip_payload(
     text: Option<String>,
     png: Option<Vec<u8>>,
-    dib_png: Option<Vec<u8>>,
+    dib: Option<Vec<u8>>,
 ) -> Option<ClipPayload> {
     if let Some(t) = text {
         let t = t.trim_end_matches('\0').to_string();
@@ -153,12 +475,7 @@ pub fn pick_clip_payload(
             return Some(ClipPayload::Text(t));
         }
     }
-    if let Some(p) = png {
-        if p.len() > 8 {
-            return Some(ClipPayload::Image(p));
-        }
-    }
-    dib_png.map(ClipPayload::Image)
+    katana_shot::png_from_clip_sources(png.as_deref(), dib.as_deref()).map(ClipPayload::Image)
 }
 
 #[cfg(windows)]
@@ -594,6 +911,7 @@ fn pick_region(full: &Frame) -> Result<PhysRect, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use katana_shot::{dib_from_bgra, png_from_bgra, png_to_bgra};
 
     #[test]
     fn capture_last_without_region_errors() {
@@ -674,10 +992,25 @@ mod tests {
             Some(ClipPayload::Text(t)) => assert!(t.contains("copied text")),
             other => panic!("{other:?}"),
         }
+        let px = vec![1u8, 2, 3, 255];
+        let png = png_from_bgra(1, 1, &px).unwrap();
         assert!(matches!(
-            pick_clip_payload(Some("   ".into()), Some(vec![0x89, b'P', b'N', b'G', 1, 2, 3, 4, 5]), None),
+            pick_clip_payload(Some("   ".into()), Some(png), None),
             Some(ClipPayload::Image(_))
         ));
         assert!(pick_clip_payload(None, None, None).is_none());
+    }
+
+    #[test]
+    fn clip_image_from_dib_when_png_missing() {
+        let px = vec![9u8, 8, 7, 255];
+        let dib = dib_from_bgra(1, 1, &px).unwrap();
+        match pick_clip_payload(None, None, Some(dib)) {
+            Some(ClipPayload::Image(p)) => {
+                let (_, _, back) = png_to_bgra(&p).unwrap();
+                assert_eq!(back, px);
+            }
+            other => panic!("{other:?}"),
+        }
     }
 }

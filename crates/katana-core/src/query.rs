@@ -24,6 +24,7 @@ pub enum ShotMode {
     Region,
     Window,
     Screen,
+    Browser,
     Last,
     Delay { secs: u32 },
 }
@@ -37,6 +38,8 @@ pub enum Route {
     Keyword { name: String, arg: Option<String> },
     Files { query: String },
     Apps { query: String },
+    /// Apps + shortcuts/bookmarks + optional "run command".
+    Launch { query: String },
     Clip { query: String },
     Todo { rest: String },
     Shot { mode: ShotMode },
@@ -44,6 +47,7 @@ pub enum Route {
     Settings,
     EditKeywords,
     EditTodos,
+    KeepAwake,
     Unified { query: String },
 }
 
@@ -65,6 +69,13 @@ pub fn parse_shot_rest(rest: &str) -> ShotMode {
         || r.eq_ignore_ascii_case("s")
     {
         return ShotMode::Screen;
+    }
+    if r.eq_ignore_ascii_case("browser")
+        || r.eq_ignore_ascii_case("page")
+        || r.eq_ignore_ascii_case("sf")
+        || r.eq_ignore_ascii_case("f")
+    {
+        return ShotMode::Browser;
     }
     if r.eq_ignore_ascii_case("last") || r.eq_ignore_ascii_case("l") {
         return ShotMode::Last;
@@ -154,35 +165,43 @@ pub fn route(q: &Query, known_keyword: bool) -> Route {
                     mode: parse_shot_rest(&q.rest),
                 };
             }
-            "f" => {
+            "sr" => {
+                return Route::Shot {
+                    mode: ShotMode::Region,
+                };
+            }
+            "sw" => {
+                return Route::Shot {
+                    mode: ShotMode::Window,
+                };
+            }
+            "sf" => {
+                return Route::Shot {
+                    mode: ShotMode::Browser,
+                };
+            }
+            "f" | "file" | "files" => {
                 return Route::Files {
                     query: q.rest.clone(),
                 };
             }
-            "apps" | "app" | "a" => {
-                return Route::Apps {
+            "apps" | "app" | "a" | "cmd" | "bm" | "b" | "bookmark" | "bookmarks"
+            | "shortcuts" | "sc" | "go" | "launch" => {
+                return Route::Launch {
                     query: q.rest.clone(),
-                };
-            }
-            "bm" | "b" | "bookmark" | "bookmarks" | "shortcuts" | "sc" => {
-                return Route::Shortcuts {
-                    query: q.rest.clone(),
-                };
-            }
-            "cmd" => {
-                return Route::Shell {
-                    cmdline: q.rest.clone(),
-                    elevate: false,
                 };
             }
             "settings" | "prefs" => {
                 return Route::Settings;
             }
+            "awake" | "keepawake" | "ka" => {
+                return Route::KeepAwake;
+            }
             "keywords" | "kw" | "k" | "editkw" => {
                 if q.rest.eq_ignore_ascii_case("edit") {
                     return Route::EditKeywords;
                 }
-                return Route::Shortcuts {
+                return Route::Launch {
                     query: q.rest.clone(),
                 };
             }
@@ -325,21 +344,26 @@ mod tests {
         );
         assert_eq!(
             r("/apps chrome", false),
-            Route::Apps {
+            Route::Launch {
                 query: "chrome".into()
             }
         );
         assert_eq!(
             r("/bm rust", false),
-            Route::Shortcuts {
+            Route::Launch {
                 query: "rust".into()
             }
         );
         assert_eq!(
             r("/cmd ipconfig", false),
-            Route::Shell {
-                cmdline: "ipconfig".into(),
-                elevate: false
+            Route::Launch {
+                query: "ipconfig".into()
+            }
+        );
+        assert_eq!(
+            r("/k notepad", false),
+            Route::Launch {
+                query: "notepad".into()
             }
         );
         assert!(
@@ -347,15 +371,38 @@ mod tests {
             "bare todo is search, not a command"
         );
         assert_eq!(r("/settings", false), Route::Settings);
-        assert!(matches!(r("/keywords", false), Route::Shortcuts { .. }));
+        assert_eq!(r("/awake", false), Route::KeepAwake);
+        assert_eq!(r("/keepawake", false), Route::KeepAwake);
+        assert!(matches!(r("/keywords", false), Route::Launch { .. }));
         assert_eq!(r("/keywords edit", false), Route::EditKeywords);
         assert_eq!(r("/todos", false), Route::EditTodos);
         assert!(matches!(r("/c", false), Route::Clip { .. }));
         assert!(matches!(r("/s", false), Route::Shot { .. }));
-        assert!(matches!(r("/b", false), Route::Shortcuts { .. }));
-        assert!(matches!(r("/k", false), Route::Shortcuts { .. }));
-        assert!(matches!(r("/shortcuts", false), Route::Shortcuts { .. }));
-        assert!(matches!(r("/a", false), Route::Apps { .. }));
+        assert_eq!(
+            r("/sr", false),
+            Route::Shot {
+                mode: ShotMode::Region
+            }
+        );
+        assert_eq!(
+            r("/sw", false),
+            Route::Shot {
+                mode: ShotMode::Window
+            }
+        );
+        assert_eq!(
+            r("/sf", false),
+            Route::Shot {
+                mode: ShotMode::Browser
+            }
+        );
+        assert!(matches!(r("/file invoice", false), Route::Files { .. }));
+        assert!(matches!(r("/b", false), Route::Launch { .. }));
+        assert!(matches!(r("/k", false), Route::Launch { .. }));
+        assert!(matches!(r("/shortcuts", false), Route::Launch { .. }));
+        assert!(matches!(r("/a", false), Route::Launch { .. }));
+        assert!(matches!(r("/cmd", false), Route::Launch { .. }));
+        assert_eq!(r("/ka", false), Route::KeepAwake);
     }
 
     #[test]
@@ -373,6 +420,7 @@ mod tests {
         assert_eq!(parse_shot_rest(""), ShotMode::Region);
         assert_eq!(parse_shot_rest("window"), ShotMode::Window);
         assert_eq!(parse_shot_rest("screen"), ShotMode::Screen);
+        assert_eq!(parse_shot_rest("browser"), ShotMode::Browser);
         assert_eq!(parse_shot_rest("last"), ShotMode::Last);
         assert_eq!(parse_shot_rest("delay"), ShotMode::Delay { secs: 3 });
     }

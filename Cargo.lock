@@ -3,6 +3,12 @@
 version = 4
 
 [[package]]
+name = "adler2"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
+
+[[package]]
 name = "ahash"
 version = "0.8.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -227,7 +233,7 @@ dependencies = [
 
 [[package]]
 name = "katana"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "katana-clip",
  "katana-core",
@@ -243,7 +249,7 @@ dependencies = [
 
 [[package]]
 name = "katana-clip"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "katana-core",
  "rusqlite",
@@ -252,7 +258,7 @@ dependencies = [
 
 [[package]]
 name = "katana-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "nucleo-matcher",
  "thiserror",
@@ -260,7 +266,7 @@ dependencies = [
 
 [[package]]
 name = "katana-index"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "katana-core",
  "regex",
@@ -270,15 +276,16 @@ dependencies = [
 
 [[package]]
 name = "katana-shot"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "katana-core",
+ "miniz_oxide",
  "thiserror",
 ]
 
 [[package]]
 name = "katana-todo"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "rusqlite",
  "thiserror",
@@ -321,6 +328,15 @@ name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
+
+[[package]]
+name = "miniz_oxide"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1fa76a2c86f704bdb222d66965fb3d63269ce38518b83cb0575fca855ebb6316"
+dependencies = [
+ "adler2",
+]
 
 [[package]]
 name = "nucleo-matcher"

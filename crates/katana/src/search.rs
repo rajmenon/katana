@@ -71,7 +71,9 @@ impl Engine {
                     self.recents.clone()
                 }
             }
-            Route::Shortcuts { query } => shortcut_hits(self, query, limit),
+            Route::Shortcuts { query } | Route::Launch { query } | Route::Apps { query } => {
+                launch_hits(self, query, limit)
+            }
             Route::Calc { expr } => {
                 let title = match eval_calc(expr) {
                     Ok(v) => format!("{v}"),
@@ -104,22 +106,16 @@ impl Engine {
                 }
             }
             Route::Files { query } => {
-                let mut hits = search_apps(&self.apps, query, limit);
-                for f in self.files.search(query, limit) {
+                let q = query.trim();
+                if q.is_empty() {
+                    return crate::launcher::well_known_folder_hits();
+                }
+                let mut hits = crate::launcher::matching_folder_hits(q);
+                hits.extend(search_apps(&self.apps, q, limit.min(8)));
+                for f in self.files.search(q, limit) {
                     hits.push(file_hit(f));
                 }
                 merge_hits(hits, limit)
-            }
-            Route::Apps { query } => {
-                if query.is_empty() {
-                    self.apps
-                        .iter()
-                        .take(limit)
-                        .map(app_hit)
-                        .collect()
-                } else {
-                    search_apps(&self.apps, query, limit)
-                }
             }
             Route::Clip { query } => {
                 let Some(store) = clips else {
@@ -227,6 +223,20 @@ impl Engine {
                     })
                     .collect()
             }
+            Route::KeepAwake => {
+                let on = crate::keepawake::is_on();
+                vec![Hit::new(
+                    "cmd:/awake",
+                    if on { "/awake  ● ON" } else { "/awake" },
+                    if on {
+                        "screen stays awake  ·  ↵ toggle off"
+                    } else {
+                        "keep screen awake  ·  ↵ toggle on"
+                    },
+                    1.0,
+                    HitKind::Keyword,
+                )]
+            }
             Route::Settings | Route::EditKeywords | Route::EditTodos => vec![Hit::new(
                 "studio",
                 "Open editor",
@@ -234,13 +244,31 @@ impl Engine {
                 1.0,
                 HitKind::Keyword,
             )],
-            Route::Shot { mode } => vec![Hit::new(
-                format!("shot:{mode:?}"),
-                format!("Screenshot {mode:?}"),
-                "Capture",
-                1.0,
-                HitKind::Shot,
-            )],
+            Route::Shot { mode } => {
+                let title = match mode {
+                    katana_core::ShotMode::Region => "Region  /sr",
+                    katana_core::ShotMode::Window => "Window  /sw",
+                    katana_core::ShotMode::Screen => "Screen",
+                    katana_core::ShotMode::Browser => "Browser page  /sf",
+                    katana_core::ShotMode::Last => "Last region",
+                    katana_core::ShotMode::Delay { secs } => {
+                        return vec![Hit::new(
+                            format!("shot:{mode:?}"),
+                            format!("Screenshot delay {secs}s"),
+                            "Capture",
+                            1.0,
+                            HitKind::Shot,
+                        )];
+                    }
+                };
+                vec![Hit::new(
+                    format!("shot:{mode:?}"),
+                    title,
+                    "clipboard + Pictures\\Katana",
+                    1.0,
+                    HitKind::Shot,
+                )]
+            }
             Route::Unified { query } => {
                 let mut hits = Vec::new();
                 for kw in &self.keywords {
@@ -286,6 +314,24 @@ pub fn mark_shortcut(cmd: &str, letter: char) -> String {
     } else {
         out
     }
+}
+
+fn launch_hits(engine: &Engine, query: &str, limit: usize) -> Vec<Hit> {
+    let q = query.trim();
+    let mut hits = shortcut_hits(engine, query, limit);
+    if q.is_empty() {
+        hits.extend(engine.apps.iter().take(limit).map(app_hit));
+    } else {
+        hits.extend(search_apps(&engine.apps, q, limit));
+        hits.push(Hit::new(
+            format!("sh:{q}"),
+            q.to_string(),
+            "Run command",
+            0.35,
+            HitKind::Shell,
+        ));
+    }
+    merge_hits(hits, limit)
 }
 
 fn shortcut_hits(engine: &Engine, query: &str, limit: usize) -> Vec<Hit> {
@@ -373,18 +419,27 @@ fn command_hits() -> Vec<Hit> {
         ("/todo", Some('t'), "Tasks", HitKind::Todo),
         ("/clip", Some('c'), "Clipboard history", HitKind::Clip),
         ("/shot", Some('s'), "Screenshot", HitKind::Shot),
-        ("/k", Some('k'), "Shortcuts", HitKind::Keyword),
-        ("/cmd", None, "Run a shell command", HitKind::Shell),
+        ("/k", Some('k'), "Apps, shortcuts, run command", HitKind::Keyword),
         ("/f", Some('f'), "Search files", HitKind::File),
-        ("/apps", Some('a'), "Apps", HitKind::App),
+        ("/awake", None, "Keep screen awake", HitKind::Keyword),
         ("/settings", None, "Settings", HitKind::Keyword),
         ("g", None, "Google search (no slash)", HitKind::Keyword),
     ]
     .into_iter()
     .map(|(cmd, letter, subtitle, kind)| {
-        let title = match letter {
-            Some(l) => mark_shortcut(cmd, l),
-            None => cmd.to_string(),
+        let on = cmd == "/awake" && crate::keepawake::is_on();
+        let title = if on {
+            "/awake  ● ON".to_string()
+        } else {
+            match letter {
+                Some(l) => mark_shortcut(cmd, l),
+                None => cmd.to_string(),
+            }
+        };
+        let subtitle = if on {
+            "ON  ·  screen stays awake"
+        } else {
+            subtitle
         };
         Hit {
             id: format!("cmd:{cmd}"),
@@ -395,6 +450,7 @@ fn command_hits() -> Vec<Hit> {
             size: None,
             type_name: None,
             is_dir: false,
+            modified: None,
         }
     })
     .collect()
@@ -412,8 +468,195 @@ pub fn is_clip_blade(q: &str) -> bool {
     matches!(katana_core::slash_verb(q), Some("c" | "clip"))
 }
 
+pub fn is_file_blade(q: &str) -> bool {
+    matches!(katana_core::slash_verb(q), Some("f" | "file" | "files"))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileSort {
+    Score,
+    Name,
+    Modified,
+    Type,
+    Size,
+}
+
+/// Column x hits in the file details header (must match overlay paint).
+pub fn file_column_at(x: i32) -> FileSort {
+    if x < 330 {
+        FileSort::Name
+    } else if x < 490 {
+        FileSort::Modified
+    } else if x < 640 {
+        FileSort::Type
+    } else {
+        FileSort::Size
+    }
+}
+
+pub fn sort_file_hits(hits: &mut [Hit], sort: FileSort, desc: bool) {
+    hits.sort_by(|a, b| {
+        let ord = match sort {
+            FileSort::Score => b
+                .score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.title.to_ascii_lowercase().cmp(&b.title.to_ascii_lowercase())),
+            FileSort::Name => a
+                .title
+                .to_ascii_lowercase()
+                .cmp(&b.title.to_ascii_lowercase()),
+            FileSort::Modified => a.modified.unwrap_or(0).cmp(&b.modified.unwrap_or(0)),
+            FileSort::Type => a
+                .type_name
+                .as_deref()
+                .unwrap_or("")
+                .to_ascii_lowercase()
+                .cmp(&b.type_name.as_deref().unwrap_or("").to_ascii_lowercase()),
+            FileSort::Size => a.size.unwrap_or(0).cmp(&b.size.unwrap_or(0)),
+        };
+        if desc {
+            ord.reverse()
+        } else {
+            ord
+        }
+    });
+}
+
+pub const FILE_PAGE: usize = 8;
+pub const FILE_SEARCH_LIMIT: usize = 64;
+
+pub fn clamp_caret(len: usize, caret: usize) -> usize {
+    caret.min(len)
+}
+
+pub fn insert_at(s: &str, caret: usize, ch: char) -> (String, usize) {
+    let n = s.chars().count();
+    let caret = caret.min(n);
+    let mut out = String::with_capacity(s.len() + ch.len_utf8());
+    for (i, c) in s.chars().enumerate() {
+        if i == caret {
+            out.push(ch);
+        }
+        out.push(c);
+    }
+    if caret == n {
+        out.push(ch);
+    }
+    (out, caret + 1)
+}
+
+pub fn backspace_at(s: &str, caret: usize) -> (String, usize) {
+    if caret == 0 {
+        return (s.to_string(), 0);
+    }
+    let mut out = String::with_capacity(s.len());
+    for (i, c) in s.chars().enumerate() {
+        if i + 1 != caret {
+            out.push(c);
+        }
+    }
+    (out, caret - 1)
+}
+
+pub fn delete_at(s: &str, caret: usize) -> (String, usize) {
+    let n = s.chars().count();
+    let caret = caret.min(n);
+    let mut out = String::with_capacity(s.len());
+    for (i, c) in s.chars().enumerate() {
+        if i != caret {
+            out.push(c);
+        }
+    }
+    let n = out.chars().count();
+    (out, caret.min(n))
+}
+
+pub fn move_caret(len: usize, caret: usize, delta: i32) -> usize {
+    let caret = caret.min(len);
+    if delta < 0 {
+        caret.saturating_sub((-delta) as usize)
+    } else {
+        (caret + delta as usize).min(len)
+    }
+}
+
+/// Keep `selected` inside the visible page of `vis` rows.
+pub fn file_scroll_keep_visible(len: usize, vis: usize, selected: usize, scroll: usize) -> usize {
+    if len <= vis {
+        return 0;
+    }
+    let vis = vis.max(1);
+    let max_scroll = len - vis;
+    let sel = selected.min(len.saturating_sub(1));
+    let mut s = scroll.min(max_scroll);
+    if sel < s {
+        s = sel;
+    } else if sel >= s + vis {
+        s = sel + 1 - vis;
+    }
+    s.min(max_scroll)
+}
+
+/// Thumb offset and height inside a track of `track_h` pixels. `None` if everything fits.
+pub fn scrollbar_thumb(len: usize, vis: usize, scroll: usize, track_h: i32) -> Option<(i32, i32)> {
+    if len <= vis || track_h < 12 {
+        return None;
+    }
+    let thumb_h = ((track_h as usize * vis) / len).clamp(12, track_h as usize);
+    let max_scroll = len - vis;
+    let travel = (track_h as usize).saturating_sub(thumb_h);
+    let y = if max_scroll == 0 {
+        0
+    } else {
+        travel * scroll.min(max_scroll) / max_scroll
+    };
+    Some((y as i32, thumb_h as i32))
+}
+
+/// Horizontal shift so the caret stays inside a prompt of `avail` pixels.
+pub fn prompt_scroll_px(caret_px: i32, avail: i32) -> i32 {
+    let avail = avail.max(8);
+    (caret_px + 6 - avail).max(0)
+}
+
+pub fn scroll_from_track_click(len: usize, vis: usize, track_h: i32, click_y: i32) -> usize {
+    if len <= vis || track_h <= 0 {
+        return 0;
+    }
+    let max_scroll = len - vis;
+    let y = click_y.clamp(0, track_h) as usize;
+    max_scroll * y / track_h as usize
+}
+
+pub fn clip_hit_is_image(h: &Hit) -> bool {
+    h.kind == HitKind::Clip
+        && h.id != "clip:clear"
+        && (h.subtitle.eq_ignore_ascii_case("image")
+            || h.subtitle.to_ascii_lowercase().contains("image"))
+}
+
 pub fn is_blade_query(q: &str) -> bool {
     q.trim_start().starts_with('/')
+}
+
+/// One Esc step: `Some("/clip")` from `/clip foo`, `Some("")` from a blade root, `None` to hide.
+pub fn parent_query(raw: &str) -> Option<String> {
+    let q = raw.trim();
+    if q.is_empty() {
+        return None;
+    }
+    if let Some(verb) = katana_core::slash_verb(q) {
+        let rest = q
+            .split_once(char::is_whitespace)
+            .map(|(_, r)| r.trim())
+            .unwrap_or("");
+        if rest.is_empty() {
+            return Some(String::new());
+        }
+        return Some(format!("/{verb}"));
+    }
+    None
 }
 
 pub fn todo_list_mode(q: &str) -> bool {
@@ -433,21 +676,25 @@ pub fn blade_footer(q: &str, composing: bool) -> Option<&'static str> {
         return Some(if composing {
             "↵ save    esc cancel"
         } else {
-            "+ add    ↵ edit    % progress    alt+v done    esc home"
+            "+ add    ↵ edit    % progress    alt+v done    esc back"
         });
     }
     if is_clip_blade(q) {
-        return Some("↵ paste    del remove    esc home");
+        return Some("↵ paste    del remove    esc back");
     }
     match katana_core::slash_verb(q) {
-        Some("shot" | "ss" | "s") => Some("↵ capture    esc home"),
-        Some("f") => Some("↵ open    esc home"),
-        Some("apps" | "app" | "a") => Some("↵ open    esc home"),
-        Some("bm" | "b" | "bookmark" | "bookmarks" | "shortcuts" | "sc" | "k" | "kw" | "keywords") => {
-            Some("↵ open    esc home")
+        Some("shot" | "ss" | "s" | "sr" | "sw" | "sf") => {
+            Some("↵ capture    /sr region    /sw window    /sf browser    esc back")
         }
-        Some("cmd") => Some("↵ run    esc home"),
-        Some(_) => Some("esc home"),
+        Some("f" | "file" | "files") => {
+            Some("↵ open    ←→ caret    click headers to sort    wheel to scroll    esc back")
+        }
+        Some(
+            "apps" | "app" | "a" | "cmd" | "go" | "launch" | "bm" | "b" | "bookmark" | "bookmarks"
+                | "shortcuts" | "sc" | "k" | "kw" | "keywords",
+        ) => Some("↵ open / run    esc back"),
+        Some("awake" | "keepawake" | "ka") => Some("↵ toggle keep-awake    esc back"),
+        Some(_) => Some("esc back"),
         None => Some("↵ open    esc hide    ↑↓ select"),
     }
 }
@@ -533,13 +780,45 @@ mod tests {
         assert!(matches!(e.route_str("/clip foo"), Route::Clip { .. }));
         assert!(matches!(e.route_str("/shot last"), Route::Shot { .. }));
         assert!(matches!(e.route_str("/ss"), Route::Shot { .. }));
+        assert!(matches!(e.route_str("/sr"), Route::Shot { mode: katana_core::ShotMode::Region }));
+        assert!(matches!(e.route_str("/sw"), Route::Shot { mode: katana_core::ShotMode::Window }));
+        assert!(matches!(e.route_str("/sf"), Route::Shot { mode: katana_core::ShotMode::Browser }));
         assert!(matches!(e.route_str("/f invoice.pdf"), Route::Files { .. }));
-        assert!(matches!(e.route_str("/apps"), Route::Apps { .. }));
-        assert!(matches!(e.route_str("/cmd dir"), Route::Shell { .. }));
+        assert!(matches!(e.route_str("/apps"), Route::Launch { .. }));
+        assert!(matches!(e.route_str("/cmd dir"), Route::Launch { .. }));
+        assert!(matches!(e.route_str("/k foo"), Route::Launch { .. }));
         assert!(matches!(e.route_str("todo add x"), Route::Unified { .. }));
         assert!(matches!(e.route_str("> cargo test"), Route::Shell { elevate: false, .. }));
         assert!(matches!(e.route_str(">! diskpart"), Route::Shell { elevate: true, .. }));
         assert!(matches!(e.route_str("=2^9"), Route::Calc { .. }));
+    }
+
+    #[test]
+    fn file_empty_query_lists_user_folders() {
+        let e = eng();
+        let (r, hits) = e.search("/f", None, None, 16);
+        assert!(matches!(r, Route::Files { .. }));
+        if std::env::var("USERPROFILE").is_ok() {
+            let names: Vec<_> = hits.iter().map(|h| h.title.as_str()).collect();
+            assert!(
+                names.iter().any(|n| ["Documents", "Downloads", "Desktop", "Home"].contains(n)),
+                "{names:?}"
+            );
+            assert!(hits.iter().all(|h| h.is_dir));
+        }
+        let (_, dl) = e.search("/f download", None, None, 16);
+        assert!(
+            dl.iter().any(|h| h.title.eq_ignore_ascii_case("Downloads") && h.is_dir)
+                || dl.is_empty() && well_known_missing("Downloads"),
+            "{:?}",
+            dl.iter().map(|h| &h.title).collect::<Vec<_>>()
+        );
+    }
+
+    fn well_known_missing(name: &str) -> bool {
+        crate::launcher::well_known_user_folders()
+            .iter()
+            .all(|(n, _)| n != name)
     }
 
     #[test]
@@ -577,11 +856,77 @@ mod tests {
         assert!(hits.iter().any(|h| h.title == "/[t]odo"), "{:?}", hits.iter().map(|h| &h.title).collect::<Vec<_>>());
         assert!(hits.iter().any(|h| h.title == "/[s]hot"));
         assert!(hits.iter().any(|h| h.id == "cmd:/k"));
+        assert!(!hits.iter().any(|h| h.id == "cmd:/apps" || h.id == "cmd:/cmd"));
         assert!(!hits.iter().any(|h| h.id == "cmd:/bm" || h.id == "cmd:/keywords"));
         assert!(hits.iter().any(|h| h.id == "cmd:/todo"));
         assert!(blade_footer("", false).is_none());
         assert!(blade_footer("/todo", false).unwrap().contains("alt+v"));
         assert!(blade_footer("/clip", false).unwrap().contains("paste"));
+        assert_eq!(parent_query(""), None);
+        assert_eq!(parent_query("/clip").as_deref(), Some(""));
+        assert_eq!(parent_query("/clip secret").as_deref(), Some("/clip"));
+        assert_eq!(parent_query("/todo showall").as_deref(), Some("/todo"));
+        assert_eq!(parent_query("/f invoice.pdf").as_deref(), Some("/f"));
+        assert_eq!(parent_query("/sw").as_deref(), Some(""));
+        assert_eq!(parent_query("notepad"), None);
+        assert!(is_blade_query("/clip") && !is_blade_query("clip"));
+        assert_eq!(file_column_at(40), FileSort::Name);
+        assert_eq!(file_column_at(340), FileSort::Modified);
+        assert_eq!(file_column_at(500), FileSort::Type);
+        assert_eq!(file_column_at(650), FileSort::Size);
+        let mut hits = vec![
+            {
+                let mut h = Hit::new("file:a", "zeta.pdf", "", 0.2, HitKind::File);
+                h.size = Some(100);
+                h.type_name = Some("PDF File".into());
+                h.modified = Some(50);
+                h
+            },
+            {
+                let mut h = Hit::new("file:b", "alpha.txt", "", 0.9, HitKind::File);
+                h.size = Some(9);
+                h.type_name = Some("Text Document".into());
+                h.modified = Some(80);
+                h
+            },
+        ];
+        sort_file_hits(&mut hits, FileSort::Name, false);
+        assert_eq!(hits[0].title, "alpha.txt");
+        sort_file_hits(&mut hits, FileSort::Size, true);
+        assert_eq!(hits[0].title, "zeta.pdf");
+        sort_file_hits(&mut hits, FileSort::Modified, true);
+        assert_eq!(hits[0].title, "alpha.txt");
+        let (s, c) = insert_at("/f ", 3, 'a');
+        assert_eq!((s.as_str(), c), ("/f a", 4));
+        let (s, c) = insert_at("/f hello", 4, 'X');
+        assert_eq!((s.as_str(), c), ("/f hXello", 5));
+        let (s, c) = backspace_at("/f ab", 4);
+        assert_eq!((s.as_str(), c), ("/f b", 3));
+        let (s, c) = delete_at("/f ab", 3);
+        assert_eq!((s.as_str(), c), ("/f b", 3));
+        assert_eq!(move_caret(5, 5, -1), 4);
+        assert_eq!(move_caret(5, 0, -1), 0);
+        assert_eq!(move_caret(5, 2, 9), 5);
+        assert_eq!(file_scroll_keep_visible(20, 8, 0, 0), 0);
+        assert_eq!(file_scroll_keep_visible(20, 8, 10, 0), 3);
+        assert_eq!(file_scroll_keep_visible(20, 8, 2, 5), 2);
+        assert_eq!(file_scroll_keep_visible(5, 8, 4, 3), 0);
+        let (y, h) = scrollbar_thumb(20, 8, 0, 100).unwrap();
+        assert_eq!(y, 0);
+        assert!(h >= 12 && h < 100);
+        assert_eq!(scroll_from_track_click(20, 8, 100, 0), 0);
+        assert_eq!(scroll_from_track_click(20, 8, 100, 100), 12);
+        assert_eq!(prompt_scroll_px(40, 200), 0);
+        assert_eq!(prompt_scroll_px(250, 200), 56);
+        let mut s = "/f ".to_string();
+        let mut c = 3usize;
+        for ch in ['a', 'b', 'c'] {
+            let n = insert_at(&s, c, ch);
+            s = n.0;
+            c = n.1;
+        }
+        assert_eq!(s, "/f abc");
+        assert_eq!(c, 6);
     }
 
     #[test]
@@ -590,6 +935,14 @@ mod tests {
         assert_eq!(mark_shortcut("/keywords", 'k'), "/[k]eywords");
         assert_eq!(mark_shortcut("/clip", 'c'), "/[c]lip");
         assert_eq!(mark_shortcut("/f", 'f'), "/[f]");
+        assert!(clip_hit_is_image(&Hit::new("clip:1", "Image  8×8", "image", 1.0, HitKind::Clip)));
+        assert!(!clip_hit_is_image(&Hit::new(
+            "clip:clear",
+            "Clear all clipboard history",
+            "removes every saved clip",
+            1.0,
+            HitKind::Clip
+        )));
     }
 
     #[test]
@@ -597,9 +950,10 @@ mod tests {
         let e = eng();
         assert!(matches!(e.route_str("/c"), Route::Clip { .. }));
         assert!(matches!(e.route_str("/s"), Route::Shot { .. }));
-        assert!(matches!(e.route_str("/b"), Route::Shortcuts { .. }));
-        assert!(matches!(e.route_str("/k"), Route::Shortcuts { .. }));
-        assert!(matches!(e.route_str("/a"), Route::Apps { .. }));
+        assert!(matches!(e.route_str("/b"), Route::Launch { .. }));
+        assert!(matches!(e.route_str("/k"), Route::Launch { .. }));
+        assert!(matches!(e.route_str("/a"), Route::Launch { .. }));
+        assert!(matches!(e.route_str("/cmd"), Route::Launch { .. }));
         assert!(is_todo_blade("/t showall") && todo_list_mode("/todo showall"));
         assert!(!todo_list_mode("/todo add milk"));
     }
@@ -608,10 +962,32 @@ mod tests {
     fn bookmarks_lists_url_keywords() {
         let e = eng();
         let (r, hits) = e.search("/bm", None, None, 16);
-        assert!(matches!(r, Route::Shortcuts { .. }));
+        assert!(matches!(r, Route::Launch { .. }));
         assert!(
             hits.iter().any(|h| h.title == "g"),
             "bookmarks should include google shortcut: {hits:?}"
         );
+    }
+
+    #[test]
+    fn launch_combines_apps_shortcuts_and_run_command() {
+        let mut e = eng();
+        e.apps.push(crate::apps::AppEntry {
+            name: "Notepad".into(),
+            path: r"C:\Windows\notepad.exe".into(),
+        });
+        let (r, hits) = e.search("/k notepad", None, None, 16);
+        assert!(matches!(r, Route::Launch { .. }));
+        assert!(
+            hits.iter().any(|h| h.kind == HitKind::App && h.title == "Notepad"),
+            "apps: {hits:?}"
+        );
+        assert!(
+            hits.iter().any(|h| h.kind == HitKind::Shell && h.title == "notepad"),
+            "run command: {hits:?}"
+        );
+        let (_, empty) = e.search("/a", None, None, 16);
+        assert!(empty.iter().any(|h| h.kind == HitKind::App));
+        assert!(empty.iter().any(|h| h.id == "cmd:/shortcuts-edit" || h.kind == HitKind::Keyword));
     }
 }

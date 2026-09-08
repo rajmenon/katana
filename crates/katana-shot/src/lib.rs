@@ -153,7 +153,7 @@ fn deflate_store(data: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Decode a PNG produced by [`png_from_bgra`] (8-bit RGB, filter None, stored DEFLATE).
+/// Decode 8-bit RGB/RGBA PNG (Katana encoder or typical clipboard PNG).
 pub fn png_to_bgra(png: &[u8]) -> Result<(u32, u32, Vec<u8>), String> {
     if png.len() < 33 || png[..8] != [137, 80, 78, 71, 13, 10, 26, 10] {
         return Err("not png".into());
@@ -187,57 +187,176 @@ pub fn png_to_bgra(png: &[u8]) -> Result<(u32, u32, Vec<u8>), String> {
     if width == 0 || height == 0 {
         return Err("bad ihdr".into());
     }
-    let raw = inflate_zlib_stored(&idat)?;
+    let raw = inflate_zlib(&idat)?;
     let bpp = match color {
         2 => 3,
         6 => 4,
+        0 => 1,
+        4 => 2,
         _ => return Err("unsupported png color".into()),
     };
-    let row = 1 + width as usize * bpp;
+    let stride = width as usize * bpp;
+    let row = 1 + stride;
     if raw.len() != row * height as usize {
         return Err("png size mismatch".into());
     }
+    let unfiltered = unfilter_png(&raw, width as usize, height as usize, bpp)?;
     let mut bgra = vec![0u8; width as usize * height as usize * 4];
     for y in 0..height as usize {
-        if raw[y * row] != 0 {
-            return Err("filtered png".into());
-        }
         for x in 0..width as usize {
-            let s = y * row + 1 + x * bpp;
+            let s = y * stride + x * bpp;
             let d = (y * width as usize + x) * 4;
-            bgra[d] = raw[s + 2];
-            bgra[d + 1] = raw[s + 1];
-            bgra[d + 2] = raw[s];
-            bgra[d + 3] = if bpp == 4 { raw[s + 3] } else { 255 };
+            match color {
+                2 => {
+                    bgra[d] = unfiltered[s + 2];
+                    bgra[d + 1] = unfiltered[s + 1];
+                    bgra[d + 2] = unfiltered[s];
+                    bgra[d + 3] = 255;
+                }
+                6 => {
+                    bgra[d] = unfiltered[s + 2];
+                    bgra[d + 1] = unfiltered[s + 1];
+                    bgra[d + 2] = unfiltered[s];
+                    bgra[d + 3] = unfiltered[s + 3];
+                }
+                0 => {
+                    let g = unfiltered[s];
+                    bgra[d] = g;
+                    bgra[d + 1] = g;
+                    bgra[d + 2] = g;
+                    bgra[d + 3] = 255;
+                }
+                4 => {
+                    let g = unfiltered[s];
+                    bgra[d] = g;
+                    bgra[d + 1] = g;
+                    bgra[d + 2] = g;
+                    bgra[d + 3] = unfiltered[s + 1];
+                }
+                _ => {}
+            }
         }
     }
     Ok((width, height, bgra))
 }
 
-fn inflate_zlib_stored(z: &[u8]) -> Result<Vec<u8>, String> {
-    if z.len() < 6 {
-        return Err("short zlib".into());
+fn inflate_zlib(z: &[u8]) -> Result<Vec<u8>, String> {
+    miniz_oxide::inflate::decompress_to_vec_zlib(z).map_err(|e| format!("zlib: {e}"))
+}
+
+fn paeth(a: u8, b: u8, c: u8) -> u8 {
+    let aa = a as i16;
+    let bb = b as i16;
+    let cc = c as i16;
+    let p = aa + bb - cc;
+    let pa = (p - aa).abs();
+    let pb = (p - bb).abs();
+    let pc = (p - cc).abs();
+    if pa <= pb && pa <= pc {
+        a
+    } else if pb <= pc {
+        b
+    } else {
+        c
     }
-    let mut i = 2usize;
-    let mut out = Vec::new();
-    loop {
-        if i + 5 > z.len() {
-            return Err("short stored block".into());
-        }
-        let header = z[i];
-        i += 1;
-        let n = u16::from_le_bytes([z[i], z[i + 1]]) as usize;
-        i += 4;
-        if i + n > z.len() {
-            return Err("stored overflow".into());
-        }
-        out.extend_from_slice(&z[i..i + n]);
-        i += n;
-        if header & 1 != 0 {
-            break;
+}
+
+fn unfilter_png(raw: &[u8], width: usize, height: usize, bpp: usize) -> Result<Vec<u8>, String> {
+    let stride = width * bpp;
+    let row = 1 + stride;
+    let mut out = vec![0u8; stride * height];
+    for y in 0..height {
+        let filter = raw[y * row];
+        let src = &raw[y * row + 1..y * row + 1 + stride];
+        for x in 0..stride {
+            let left = if x >= bpp { out[y * stride + x - bpp] } else { 0 };
+            let up = if y > 0 { out[(y - 1) * stride + x] } else { 0 };
+            let ul = if y > 0 && x >= bpp {
+                out[(y - 1) * stride + x - bpp]
+            } else {
+                0
+            };
+            let pred = match filter {
+                0 => 0,
+                1 => left,
+                2 => up,
+                3 => ((left as u16 + up as u16) / 2) as u8,
+                4 => paeth(left, up, ul),
+                _ => return Err("unknown png filter".into()),
+            };
+            out[y * stride + x] = src[x].wrapping_add(pred);
         }
     }
     Ok(out)
+}
+
+/// Prefer a DIB (always decodable) so clipboard previews do not depend on foreign PNG codecs.
+pub fn png_from_clip_sources(png: Option<&[u8]>, dib: Option<&[u8]>) -> Option<Vec<u8>> {
+    if let Some(d) = dib {
+        if let Ok((w, h, bgra)) = bgra_from_dib(d) {
+            if let Ok(p) = png_from_bgra(w, h, &bgra) {
+                return Some(p);
+            }
+        }
+    }
+    if let Some(p) = png {
+        if let Ok((w, h, bgra)) = png_to_bgra(p) {
+            return png_from_bgra(w, h, &bgra).ok().or_else(|| Some(p.to_vec()));
+        }
+    }
+    None
+}
+
+/// Stitch equal-width BGRA slices top-to-bottom, dropping overlapping rows.
+pub fn stitch_vertical_bgra(
+    width: u32,
+    slices: &[(u32, &[u8])],
+) -> Result<(u32, u32, Vec<u8>), String> {
+    if slices.is_empty() {
+        return Err("no slices".into());
+    }
+    let w = width as usize;
+    let mut height = slices[0].0 as usize;
+    let mut out = slices[0].1.to_vec();
+    if out.len() != w * height * 4 {
+        return Err("slice size".into());
+    }
+    for (h, px) in slices.iter().skip(1) {
+        let h = *h as usize;
+        if px.len() != w * h * 4 {
+            return Err("slice size".into());
+        }
+        let ov = overlap_rows(&out, height, px, h, w);
+        let skip = ov.min(h);
+        if skip < h {
+            out.extend_from_slice(&px[skip * w * 4..]);
+            height += h - skip;
+        }
+    }
+    Ok((width, height as u32, out))
+}
+
+fn overlap_rows(acc: &[u8], acc_h: usize, next: &[u8], next_h: usize, w: usize) -> usize {
+    let max = acc_h.min(next_h);
+    if max < 1 {
+        return 0;
+    }
+    let stride = w * 4;
+    for ov in (1..=max).rev() {
+        let mut ok = true;
+        for i in 0..ov {
+            let a = (acc_h - ov + i) * stride;
+            let b = i * stride;
+            if acc[a..a + stride] != next[b..b + stride] {
+                ok = false;
+                break;
+            }
+        }
+        if ok {
+            return ov;
+        }
+    }
+    0
 }
 
 /// Nearest-neighbor scale for clipboard thumbnails.
@@ -422,6 +541,48 @@ mod tests {
         assert_eq!(parse_shot_rest("last"), ShotMode::Last);
         assert_eq!(parse_shot_rest("window"), ShotMode::Window);
         assert_eq!(parse_shot_rest("screen"), ShotMode::Screen);
+        assert_eq!(parse_shot_rest("browser"), ShotMode::Browser);
         assert_eq!(parse_shot_rest(""), ShotMode::Region);
+    }
+
+    #[test]
+    fn png_filtered_and_deflated_decodes() {
+        // 2×1 RGB, filter Sub on second pixel, zlib-deflated IDAT.
+        let mut raw = vec![1u8]; // filter Sub
+        raw.extend_from_slice(&[10, 20, 30, 5, 6, 7]); // first + deltas
+        let z = miniz_oxide::deflate::compress_to_vec_zlib(&raw, 6);
+        let mut png = Vec::new();
+        png.extend_from_slice(&[137, 80, 78, 71, 13, 10, 26, 10]);
+        let mut ihdr = Vec::new();
+        ihdr.extend_from_slice(&2u32.to_be_bytes());
+        ihdr.extend_from_slice(&1u32.to_be_bytes());
+        ihdr.extend_from_slice(&[8, 2, 0, 0, 0]);
+        write_chunk(&mut png, *b"IHDR", &ihdr);
+        write_chunk(&mut png, *b"IDAT", &z);
+        write_chunk(&mut png, *b"IEND", &[]);
+        let (w, h, bgra) = png_to_bgra(&png).unwrap();
+        assert_eq!((w, h), (2, 1));
+        assert_eq!(&bgra[0..4], &[30, 20, 10, 255]);
+        assert_eq!(&bgra[4..8], &[37, 26, 15, 255]);
+    }
+
+    #[test]
+    fn stitch_drops_overlapping_rows() {
+        let w = 1u32;
+        let top = vec![1u8, 2, 3, 255, 4, 5, 6, 255];
+        let bot = vec![4u8, 5, 6, 255, 7, 8, 9, 255];
+        let (ww, h, out) = stitch_vertical_bgra(w, &[(2, top.as_slice()), (2, bot.as_slice())]).unwrap();
+        assert_eq!((ww, h), (1, 3));
+        assert_eq!(out.len(), 12);
+        assert_eq!(&out[8..12], &[7, 8, 9, 255]);
+    }
+
+    #[test]
+    fn png_from_clip_sources_prefers_dib() {
+        let px = vec![9u8, 8, 7, 255];
+        let dib = dib_from_bgra(1, 1, &px).unwrap();
+        let png = png_from_clip_sources(None, Some(&dib)).unwrap();
+        let (_, _, back) = png_to_bgra(&png).unwrap();
+        assert_eq!(back, px);
     }
 }

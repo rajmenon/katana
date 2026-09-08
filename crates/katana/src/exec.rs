@@ -13,7 +13,7 @@ pub fn perform(action: &ResolvedAction) -> Result<String, String> {
             Ok(format!("launch {path}"))
         }
         ResolvedAction::Shell { cmdline, admin } => {
-            shell(cmdline, *admin)?;
+            run_shell(cmdline, *admin).map_err(|c| format!("exit {c}"))?;
             Ok(format!("shell {cmdline}"))
         }
         ResolvedAction::Workflow(steps) => {
@@ -24,6 +24,15 @@ pub fn perform(action: &ResolvedAction) -> Result<String, String> {
             Ok(out.join(" || "))
         }
     }
+}
+
+/// Open a file or folder with the default app / Explorer.
+pub fn open_in_shell(path: &std::path::Path) -> Result<(), String> {
+    let s = path.as_os_str();
+    if s.is_empty() {
+        return Err("empty path".into());
+    }
+    launch(&path.to_string_lossy(), &[], false)
 }
 
 fn open_url(url: &str) -> Result<(), String> {
@@ -96,24 +105,29 @@ fn shell_open(path: &str, args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-fn shell(cmdline: &str, admin: bool) -> Result<(), String> {
+/// Run a command line and wait. `Err(exit_code)` when the process exits non-zero.
+pub fn run_shell(cmdline: &str, admin: bool) -> Result<(), i32> {
     if admin {
-        return shell_runas("powershell", &["-NoProfile".into(), "-Command".into(), cmdline.into()]);
+        return shell_runas("powershell", &["-NoProfile".into(), "-Command".into(), cmdline.into()])
+            .map_err(|_| 1);
     }
-    let shell = if which("pwsh") {
-        "pwsh"
-    } else {
-        "powershell"
-    };
-    let mut cmd = std::process::Command::new(shell);
-    cmd.args(["-NoProfile", "-Command", cmdline]);
+    // cmd /C so the process exit code is the command's (PowerShell often returns 0).
+    let mut cmd = std::process::Command::new("cmd");
+    cmd.args(["/C", cmdline]);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(0x08000000);
     }
-    cmd.spawn().map_err(|e| e.to_string())?;
-    Ok(())
+    match cmd.status() {
+        Ok(st) if st.success() => Ok(()),
+        Ok(st) => Err(st.code().unwrap_or(1)),
+        Err(_) => Err(1),
+    }
+}
+
+pub fn cmd_failed_label(exit: i32, cmdline: &str) -> String {
+    format!("exit {exit}: {cmdline}")
 }
 
 fn shell_runas(file: &str, args: &[String]) -> Result<(), String> {
@@ -153,22 +167,27 @@ fn shell_runas(file: &str, args: &[String]) -> Result<(), String> {
     }
 }
 
-fn which(name: &str) -> bool {
-    let Ok(path) = std::env::var("PATH") else {
-        return false;
-    };
-    for dir in path.split(';') {
-        let p = std::path::Path::new(dir).join(format!("{name}.exe"));
-        if p.exists() {
-            return true;
-        }
-    }
-    false
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn open_in_shell_rejects_empty() {
+        assert!(open_in_shell(std::path::Path::new("")).is_err());
+    }
+
+    #[test]
+    fn run_shell_exit_1() {
+        assert_eq!(run_shell("exit 1", false), Err(1));
+        assert_eq!(run_shell("exit 0", false), Ok(()));
+    }
+
+    #[test]
+    fn cmd_failed_label_includes_exit() {
+        let s = cmd_failed_label(1, "false");
+        assert!(s.starts_with("exit 1"), "{s}");
+        assert!(s.contains("false"), "{s}");
+    }
 
     #[test]
     fn perform_describes_url_without_requiring_browser_success_path() {

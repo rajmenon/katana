@@ -6,6 +6,7 @@ mod capture;
 mod cli;
 mod editors;
 mod exec;
+mod keepawake;
 mod launcher;
 mod persist;
 mod search;
@@ -84,22 +85,22 @@ mod tests {
             ("https://x.com", |r| matches!(r, Route::Url { .. })),
             ("g rust", |r| matches!(r, Route::Keyword { name, .. } if name == "g")),
             ("/f readme", |r| matches!(r, Route::Files { .. })),
-            ("/apps", |r| matches!(r, Route::Apps { .. })),
+            ("/apps", |r| matches!(r, Route::Launch { .. })),
             ("/clip", |r| matches!(r, Route::Clip { .. })),
             ("/c", |r| matches!(r, Route::Clip { .. })),
             ("/todo", |r| matches!(r, Route::Todo { .. })),
             ("/t", |r| matches!(r, Route::Todo { .. })),
             ("/shot region", |r| matches!(r, Route::Shot { .. })),
             ("/s", |r| matches!(r, Route::Shot { .. })),
-            ("/b", |r| matches!(r, Route::Shortcuts { .. })),
-            ("/k", |r| matches!(r, Route::Shortcuts { .. })),
-            ("/shortcuts", |r| matches!(r, Route::Shortcuts { .. })),
-            ("/a", |r| matches!(r, Route::Apps { .. })),
+            ("/b", |r| matches!(r, Route::Launch { .. })),
+            ("/k", |r| matches!(r, Route::Launch { .. })),
+            ("/shortcuts", |r| matches!(r, Route::Launch { .. })),
+            ("/a", |r| matches!(r, Route::Launch { .. })),
             ("/ss last", |r| matches!(r, Route::Shot { .. })),
-            ("/bm rust", |r| matches!(r, Route::Shortcuts { .. })),
-            ("/cmd dir", |r| matches!(r, Route::Shell { .. })),
+            ("/bm rust", |r| matches!(r, Route::Launch { .. })),
+            ("/cmd dir", |r| matches!(r, Route::Launch { .. })),
             ("/settings", |r| matches!(r, Route::Settings)),
-            ("/keywords", |r| matches!(r, Route::Shortcuts { .. })),
+            ("/keywords", |r| matches!(r, Route::Launch { .. })),
             ("/keywords edit", |r| matches!(r, Route::EditKeywords)),
             ("/todos", |r| matches!(r, Route::EditTodos)),
         ];

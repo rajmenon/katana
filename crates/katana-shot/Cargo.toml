@@ -7,3 +7,4 @@ license.workspace = true
 [dependencies]
 thiserror.workspace = true
 katana-core = { path = "../katana-core" }
+miniz_oxide = "0.8"

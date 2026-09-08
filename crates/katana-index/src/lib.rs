@@ -67,6 +67,26 @@ pub fn type_name_of(name: &str, is_dir: bool) -> String {
     }
 }
 
+/// Explorer-like Date modified (`2026-09-02 13:04`).
+pub fn format_mtime(unix_secs: u64) -> String {
+    let days = unix_secs / 86400;
+    let rem = unix_secs % 86400;
+    let hour = rem / 3600;
+    let min = (rem % 3600) / 60;
+    // Civil from days since 1970-01-01 (Howard Hinnant).
+    let z = days as i64 + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02} {hour:02}:{min:02}")
+}
+
 pub fn format_size(bytes: u64) -> String {
     const KB: f64 = 1024.0;
     const MB: f64 = KB * 1024.0;
@@ -147,28 +167,41 @@ impl NameIndex {
     }
 
     pub fn insert_full(&mut self, name: &str, path: &str, size: Option<u64>, is_dir: bool) {
+        if name.is_empty() || path.is_empty() {
+            return;
+        }
+        let name_b = name.as_bytes();
+        let path_b = path.as_bytes();
+        let name_len = name_b.len().min(u16::MAX as usize);
         let name_off = self.names.len() as u32;
-        self.names.extend_from_slice(name.as_bytes());
+        self.names.extend_from_slice(&name_b[..name_len]);
         let path_off = self.paths.len() as u32;
-        self.paths.extend_from_slice(path.as_bytes());
+        self.paths.extend_from_slice(path_b);
         self.entries.push(Entry {
             name_off,
-            name_len: name.len() as u16,
+            name_len: name_len as u16,
             path_off,
-            path_len: path.len() as u32,
+            path_len: path_b.len() as u32,
             size: size.unwrap_or(0),
             flags: if is_dir { 1 } else { 0 } | if size.is_some() { 2 } else { 0 },
         });
     }
 
+    fn slice_utf8(buf: &[u8], off: u32, len: u32) -> &str {
+        let s = off as usize;
+        let e = s.saturating_add(len as usize);
+        if s > buf.len() || e > buf.len() || s > e {
+            return "";
+        }
+        std::str::from_utf8(&buf[s..e]).unwrap_or("")
+    }
+
     fn name_at(&self, e: &Entry) -> &str {
-        let s = e.name_off as usize;
-        std::str::from_utf8(&self.names[s..s + e.name_len as usize]).unwrap_or("")
+        Self::slice_utf8(&self.names, e.name_off, e.name_len as u32)
     }
 
     fn path_at(&self, e: &Entry) -> &str {
-        let s = e.path_off as usize;
-        std::str::from_utf8(&self.paths[s..s + e.path_len as usize]).unwrap_or("")
+        Self::slice_utf8(&self.paths, e.path_off, e.path_len)
     }
 
     fn to_hit(&self, e: &Entry, score: f32) -> FileHit {
@@ -210,9 +243,20 @@ impl NameIndex {
             FileQuery::Fuzzy(needle) => {
                 let mut eng = FuzzyEngine::new();
                 let pat = FuzzyEngine::prepare(needle);
+                let nl = needle.to_ascii_lowercase();
                 for (i, e) in self.entries.iter().enumerate() {
                     let name = self.name_at(e);
-                    if let Some(score) = eng.score_prepared(&pat, name) {
+                    if name.is_empty() {
+                        continue;
+                    }
+                    let score = if name.eq_ignore_ascii_case(needle) {
+                        Some(1.0)
+                    } else if name.to_ascii_lowercase().starts_with(&nl) {
+                        Some(0.96)
+                    } else {
+                        eng.score_prepared(&pat, name)
+                    };
+                    if let Some(score) = score {
                         push(&mut heap, score, i as u32);
                     }
                 }
@@ -245,9 +289,10 @@ impl NameIndex {
         ranked.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
         ranked
             .into_iter()
-            .map(|(key, idx)| {
-                let e = &self.entries[idx as usize];
-                self.to_hit(e, key as f32 / 10_000.0)
+            .filter_map(|(key, idx)| {
+                self.entries
+                    .get(idx as usize)
+                    .map(|e| self.to_hit(e, key as f32 / 10_000.0))
             })
             .collect()
     }
@@ -411,16 +456,37 @@ impl NameIndex {
 
 /// Build the live index: MFT+path walk, else user-folder walk.
 pub fn build_live_index(user_roots: &[PathBuf]) -> NameIndex {
-    #[cfg(windows)]
-    {
-        if let Some(letter) = boot_drive_letter() {
-            match try_mft_volume(letter) {
-                Ok(idx) => return idx,
-                Err(_) => {}
+    let mut idx = {
+        #[cfg(windows)]
+        {
+            if let Some(letter) = boot_drive_letter() {
+                if let Ok(idx) = try_mft_volume(letter) {
+                    idx
+                } else {
+                    walk_roots(user_roots)
+                }
+            } else {
+                walk_roots(user_roots)
             }
         }
+        #[cfg(not(windows))]
+        {
+            walk_roots(user_roots)
+        }
+    };
+    inject_folder_roots(&mut idx, user_roots);
+    idx
+}
+
+fn inject_folder_roots(idx: &mut NameIndex, roots: &[PathBuf]) {
+    for root in roots {
+        if !root.is_dir() {
+            continue;
+        }
+        if let Some(name) = root.file_name().and_then(|n| n.to_str()) {
+            idx.insert_full(name, &root.to_string_lossy(), None, true);
+        }
     }
-    walk_roots(user_roots)
 }
 
 fn boot_drive_letter() -> Option<char> {
@@ -434,6 +500,11 @@ fn boot_drive_letter() -> Option<char> {
 pub fn walk_roots(roots: &[PathBuf]) -> NameIndex {
     let mut idx = NameIndex::new();
     for root in roots {
+        if let Some(name) = root.file_name().and_then(|n| n.to_str()) {
+            if root.is_dir() {
+                idx.insert_full(name, &root.to_string_lossy(), None, true);
+            }
+        }
         walk_into(&mut idx, root);
     }
     idx
@@ -729,6 +800,8 @@ mod tests {
         assert_eq!(w[0].type_name, "PDF File");
         assert_eq!(w[0].size, Some(2400));
         assert_eq!(format_size(2400), "2.3 KB");
+        assert_eq!(format_mtime(0), "1970-01-01 00:00");
+        assert_eq!(format_mtime(1_704_067_200), "2024-01-01 00:00");
         let r = idx.search("re:note.*", 10);
         assert_eq!(r[0].name, "notes.txt");
         assert!(wildcard_match("inv?ice.*", "invoice.pdf"));

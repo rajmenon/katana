@@ -20,9 +20,13 @@ Do not add: `tauri`, `wry`, `tokio`, `reqwest`, crate `image`, webview, egui/efr
 ```
 cargo test --workspace
 cargo build --release -p katana
+# then overwrite the launched copy:
+#   %USERPROFILE%\tools\katana.exe
 katana                  # overlay
 katana todo add "…"     # CLI (TODO_DB_PATH override)
 ```
+
+Install path: always replace `%USERPROFILE%\tools\katana.exe` after a release build (user preference). If the exe is locked, stop the tray process and overwrite — no sidecar names.
 
 ## Layout
 

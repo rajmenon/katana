@@ -25,6 +25,8 @@ pub struct Hit {
     pub size: Option<u64>,
     pub type_name: Option<String>,
     pub is_dir: bool,
+    /// Unix seconds, Explorer Date modified.
+    pub modified: Option<u64>,
 }
 
 impl Hit {
@@ -44,6 +46,7 @@ impl Hit {
             size: None,
             type_name: None,
             is_dir: false,
+            modified: None,
         }
     }
 }
