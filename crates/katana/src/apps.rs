@@ -79,6 +79,7 @@ pub fn search_apps(apps: &[AppEntry], query: &str, limit: usize) -> Vec<Hit> {
     let mut eng = FuzzyEngine::new();
     let pat = FuzzyEngine::prepare(query);
     let ql = query.trim().to_ascii_lowercase();
+    let bare = strip_launch_ext(&ql);
     let mut hits = Vec::new();
     for a in apps {
         let stem = a
@@ -94,7 +95,8 @@ pub fn search_apps(apps: &[AppEntry], query: &str, limit: usize) -> Vec<Hit> {
         }
         let name_l = a.name.to_ascii_lowercase();
         let stem_l = stem.to_ascii_lowercase();
-        if !ql.is_empty() && (name_l.contains(&ql) || stem_l.contains(&ql)) {
+        if !ql.is_empty() && (name_l.contains(&ql) || stem_l.contains(&ql) || name_l.contains(bare) || stem_l.contains(bare))
+        {
             score = Some(score.unwrap_or(0.0).max(0.93));
         }
         let Some(score) = score else {
@@ -150,9 +152,33 @@ pub fn builtin_programs() -> Vec<AppEntry> {
     out
 }
 
+fn strip_launch_ext(q: &str) -> &str {
+    let b = q.as_bytes();
+    if b.len() > 4 && b[b.len() - 4] == b'.' {
+        let ext = &q[q.len() - 3..];
+        if ext.eq_ignore_ascii_case("exe") || ext.eq_ignore_ascii_case("lnk") {
+            return &q[..q.len() - 4];
+        }
+    }
+    q
+}
+
 fn skip_program_dir(name: &str) -> bool {
     let n = name.to_ascii_lowercase();
-    n == "windowsapps" || n == "winsxs" || katana_index::skip_dir(name)
+    matches!(
+        n.as_str(),
+        "windowsapps"
+            | "winsxs"
+            | "jetbrains"
+            | "windows kits"
+            | "microsoft visual studio"
+            | "reference assemblies"
+            | "dotnet"
+            | "microsoft sdks"
+            | "android"
+            | "nuget"
+            | "msbuild"
+    ) || katana_index::skip_dir(name)
 }
 
 fn skip_exe_stem(stem: &str) -> bool {
@@ -170,8 +196,8 @@ fn skip_exe_stem(stem: &str) -> bool {
         )
 }
 
-/// `.exe` files under Program Files and per-user Programs. Depth-capped.
-/// Does not walk PATH or System32 (that stalls startup and floods results).
+/// Shallow `.exe` scan. A deep walk of Program Files (JetBrains, SDKs) stalls
+/// the index thread and floods `/f` with component binaries.
 pub fn scan_installed_exes(cap: usize) -> Vec<AppEntry> {
     let mut dirs = Vec::new();
     if let Ok(pf) = std::env::var("ProgramFiles") {
@@ -184,19 +210,28 @@ pub fn scan_installed_exes(cap: usize) -> Vec<AppEntry> {
         dirs.push(PathBuf::from(local).join("Programs"));
     }
     let mut out = Vec::new();
+    let mut dirs_left = 800u32;
     for d in dirs {
-        scan_exe_dir(&d, &mut out, 0, 5, cap);
-        if out.len() >= cap {
+        scan_exe_dir(&d, &mut out, 0, 2, cap, &mut dirs_left);
+        if out.len() >= cap || dirs_left == 0 {
             break;
         }
     }
     out
 }
 
-fn scan_exe_dir(dir: &Path, out: &mut Vec<AppEntry>, depth: u8, max_depth: u8, cap: usize) {
-    if out.len() >= cap || depth > max_depth {
+fn scan_exe_dir(
+    dir: &Path,
+    out: &mut Vec<AppEntry>,
+    depth: u8,
+    max_depth: u8,
+    cap: usize,
+    dirs_left: &mut u32,
+) {
+    if out.len() >= cap || depth > max_depth || *dirs_left == 0 {
         return;
     }
+    *dirs_left = dirs_left.saturating_sub(1);
     let rd = match std::fs::read_dir(dir) {
         Ok(r) => r,
         Err(_) => return,
@@ -239,8 +274,8 @@ fn scan_exe_dir(dir: &Path, out: &mut Vec<AppEntry>, depth: u8, max_depth: u8, c
         out.push(AppEntry { name: stem, path: p });
     }
     for s in subdirs {
-        scan_exe_dir(&s, out, depth + 1, max_depth, cap);
-        if out.len() >= cap {
+        scan_exe_dir(&s, out, depth + 1, max_depth, cap, dirs_left);
+        if out.len() >= cap || *dirs_left == 0 {
             break;
         }
     }
@@ -258,7 +293,7 @@ pub fn dedup_apps(apps: &mut Vec<AppEntry>) {
 pub fn collect_programs() -> Vec<AppEntry> {
     let mut apps = scan_apps(&default_app_dirs());
     apps.extend(builtin_programs());
-    apps.extend(scan_installed_exes(4000));
+    apps.extend(scan_installed_exes(400));
     dedup_apps(&mut apps);
     apps
 }
@@ -313,7 +348,8 @@ mod tests {
         std::fs::write(app.join("unins000.exe"), b"MZ").unwrap();
         std::fs::write(root.join("notes.txt"), b"no").unwrap();
         let mut found = Vec::new();
-        scan_exe_dir(&root, &mut found, 0, 5, 20);
+        let mut dirs_left = 50u32;
+        scan_exe_dir(&root, &mut found, 0, 5, 20, &mut dirs_left);
         assert!(
             found.iter().any(|a| a.name == "widget"),
             "exe must be indexed: {found:?}"
@@ -348,6 +384,11 @@ mod tests {
         assert!(ps.iter().any(|h| h.title == "PowerShell"), "{ps:?}");
         let wt = search_apps(&apps, "wt", 5);
         assert!(wt.iter().any(|h| h.title == "Windows Terminal"), "{wt:?}");
+        let typed = search_apps(&apps, "terminal.exe", 5);
+        assert!(
+            typed.iter().any(|h| h.title == "Windows Terminal"),
+            "typing terminal.exe must still find Windows Terminal: {typed:?}"
+        );
     }
 
     #[cfg(windows)]

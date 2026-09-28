@@ -50,7 +50,8 @@ mod win {
         BeginPaint, CreateFontW, CreatePen, CreateRoundRectRgn, CreateSolidBrush, DeleteObject,
         EndPaint, FillRect, InvalidateRect, LineTo, MoveToEx, SelectObject, SetBkMode,
         DrawTextW, IntersectClipRect, RestoreDC, SaveDC, SetDIBitsToDevice, SetTextColor,
-        SetWindowRgn, TextOutW, DT_CALCRECT, DT_NOPREFIX, DT_SINGLELINE,
+        SetWindowRgn, TextOutW, DT_CALCRECT, DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE,
+        DT_VCENTER,
         BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, PS_SOLID, TRANSPARENT,
         PAINTSTRUCT,
     };
@@ -1330,8 +1331,24 @@ mod win {
             draw_item_icon(hdc, 16, y + if file_mode { 6 } else { 10 }, h);
             SetTextColor(hdc, COLORREF(TEXT));
             SelectObject(hdc, if file_mode { small } else { font });
-            let title: Vec<u16> = h.title.encode_utf16().collect();
-            let _ = TextOutW(hdc, 40, y + if file_mode { 6 } else { 4 }, &title);
+            let mut title: Vec<u16> = h.title.encode_utf16().collect();
+            if file_mode {
+                // Keep the name out of the date / type / size columns.
+                let mut tr = RECT {
+                    left: 40,
+                    top: y + 2,
+                    right: 332,
+                    bottom: y + row_h - 2,
+                };
+                let _ = DrawTextW(
+                    hdc,
+                    &mut title,
+                    &mut tr,
+                    DT_END_ELLIPSIS | DT_SINGLELINE | DT_NOPREFIX | DT_VCENTER,
+                );
+            } else {
+                let _ = TextOutW(hdc, 40, y + 4, &title);
+            }
             SetTextColor(hdc, COLORREF(MUTED));
             SelectObject(hdc, small);
             if file_mode && h.kind == katana_core::HitKind::File {

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.1 — 2026-09-28
+
+### Files (`/f`)
+- Typing no longer hangs. File search matches the name directly instead of fuzzy-scanning the whole index on every keystroke
+- `/f terminal.exe` finds Windows Terminal, not unrelated component exes
+- Long names stay in the name column, so **Date modified** stays visible
+- Program indexing no longer walks deep vendor trees (JetBrains, SDKs)
+
 ## 0.3.0 — 2026-09-28
 
 ### Files (`/f`)

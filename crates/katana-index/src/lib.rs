@@ -6,7 +6,6 @@ use std::time::UNIX_EPOCH;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashSet};
 
-use katana_core::FuzzyEngine;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -289,21 +288,14 @@ impl NameIndex {
         };
         match &kind {
             FileQuery::Fuzzy(needle) => {
-                let mut eng = FuzzyEngine::new();
-                let pat = FuzzyEngine::prepare(needle);
+                // Substring/prefix only. Nucleo over every name stalls the UI
+                // once the index holds a volume's worth of files.
                 let nl = needle.to_ascii_lowercase();
+                let stem = launch_stem(&nl);
                 for (i, e) in self.entries.iter().enumerate() {
                     let name = self.name_at(e);
-                    if name.is_empty() {
-                        continue;
-                    }
-                    let score = if name.eq_ignore_ascii_case(needle) {
-                        Some(1.0)
-                    } else if name.to_ascii_lowercase().starts_with(&nl) {
-                        Some(0.96)
-                    } else {
-                        eng.score_prepared(&pat, name)
-                    };
+                    let score = name_match_score(name, nl.as_bytes())
+                        .or_else(|| stem.and_then(|s| name_match_score(name, s)));
                     if let Some(score) = score {
                         push(&mut heap, score, i as u32);
                     }
@@ -343,9 +335,77 @@ impl NameIndex {
                     .get(idx as usize)
                     .map(|e| self.to_hit(e, key as f32 / 10_000.0))
             })
-            .filter(|h| seen.insert(h.path.to_ascii_lowercase()))
+            .filter(|h| seen.insert(dedupe_path(&h.path)))
             .collect()
     }
+}
+
+/// `terminal.exe` → `terminal`, so a typed exe name still matches `WindowsTerminal.exe`.
+fn launch_stem(needle_lower: &str) -> Option<&[u8]> {
+    let stem = needle_lower.strip_suffix(".exe").or_else(|| needle_lower.strip_suffix(".lnk"))?;
+    if stem.len() < 2 || stem.len() == needle_lower.len() {
+        None
+    } else {
+        Some(stem.as_bytes())
+    }
+}
+
+fn name_match_score(name: &str, needle_lower: &[u8]) -> Option<f32> {
+    if needle_lower.is_empty() || name.is_empty() {
+        return None;
+    }
+    if eq_ignore_ascii(name, needle_lower) {
+        Some(1.0)
+    } else if starts_ignore_ascii(name, needle_lower) {
+        Some(0.96)
+    } else if contains_ignore_ascii(name, needle_lower) {
+        Some(0.84)
+    } else {
+        None
+    }
+}
+
+fn eq_ignore_ascii(hay: &str, needle_lower: &[u8]) -> bool {
+    let h = hay.as_bytes();
+    h.len() == needle_lower.len()
+        && h.iter()
+            .zip(needle_lower)
+            .all(|(hb, nb)| hb.to_ascii_lowercase() == *nb)
+}
+
+fn starts_ignore_ascii(hay: &str, needle_lower: &[u8]) -> bool {
+    let h = hay.as_bytes();
+    h.len() >= needle_lower.len()
+        && h.iter()
+            .zip(needle_lower)
+            .all(|(hb, nb)| hb.to_ascii_lowercase() == *nb)
+}
+
+fn contains_ignore_ascii(hay: &str, needle_lower: &[u8]) -> bool {
+    let h = hay.as_bytes();
+    if needle_lower.is_empty() || needle_lower.len() > h.len() {
+        return needle_lower.is_empty();
+    }
+    h.windows(needle_lower.len())
+        .any(|w| w.iter().zip(needle_lower).all(|(hb, nb)| hb.to_ascii_lowercase() == *nb))
+}
+
+fn dedupe_path(path: &str) -> String {
+    let p = path.trim();
+    let p = p.strip_prefix(r"\\?\").unwrap_or(p);
+    let p = p.strip_prefix(r"\??\").unwrap_or(p);
+    let mut s = String::with_capacity(p.len());
+    for c in p.chars() {
+        if c == '/' {
+            s.push('\\');
+        } else {
+            s.extend(c.to_lowercase());
+        }
+    }
+    while s.ends_with('\\') {
+        s.pop();
+    }
+    s
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -950,5 +1010,37 @@ mod tests {
             "Documents under Home must not be indexed twice"
         );
         let _ = fs::remove_dir_all(parent);
+    }
+
+    #[test]
+    fn terminal_exe_matches_terminal_not_a_fuzzy_component() {
+        let mut idx = NameIndex::new();
+        idx.insert_meta(
+            "JetBrains.ReSharper.Features.WinForms.Designer.External.Core.exe",
+            r"C:\Program Files\JetBrains\resharper.exe",
+            Some(215_000),
+            false,
+            Some(1_700_000_000),
+        );
+        idx.insert_meta(
+            "WindowsTerminal.exe",
+            r"C:\Program Files\Windows Terminal\WindowsTerminal.exe",
+            Some(900_000),
+            false,
+            Some(1_700_000_100),
+        );
+        let hits = idx.search("terminal.exe", 8);
+        assert!(
+            hits.iter().any(|h| h.name == "WindowsTerminal.exe"),
+            "{hits:?}"
+        );
+        assert!(
+            hits.iter().all(|h| !h.name.contains("ReSharper")),
+            "component exes must not match terminal.exe: {hits:?}"
+        );
+        assert_eq!(
+            hits.iter().find(|h| h.name == "WindowsTerminal.exe").unwrap().modified,
+            Some(1_700_000_100)
+        );
     }
 }
