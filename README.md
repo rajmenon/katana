@@ -12,11 +12,11 @@ Katana lives in the tray. Press **Alt+Space** and it is in your hands — one th
 ## Blades
 
 - **Search** files and apps as you type. Wildcards `*.pdf`, `inv?ice.*` · regex `re:inv.*` or `/inv.*pdf/`
-- **Launch** (`/k`, also `/a` `/cmd` `/b`) — apps, your keywords (`g rust`, `gh`, `docs`), browser bookmarks, and **Run command** for whatever you typed. `$P$` is whatever you type after a keyword.
+- **Launch** (`/k`, also `/a` `/cmd` `/b`) — apps, your keywords (`g rust`, `gh`, `docs`), browser bookmarks, and **Run command** for whatever you typed. `$P$` is whatever you type after a keyword. Type `powershell` or `terminal` to launch them; no keyword needed.
 - **`/todo`** tasks with progress, same store as `katana todo` on the command line
 - **`/clip`** clipboard history (text and images). Enter pastes into the last focused field; Delete removes one. **Win+Alt+C**
 - **`/shot`** and **PrintScreen** — `/sr` region, `/sw` window, `/sf` full browser page (otherwise window). Copy to clipboard **and** save under **Pictures\Katana**. Click the toast to open the file; tray → **Open screenshots folder**.
-- **`/f`** Explorer-style details table. Empty `/f` lists **Documents, Downloads, Desktop, Pictures, Videos, Music, Home**. Type to search; those folders also match by name. Keywords: `documents`, `downloads`, `desktop`, `pictures`, `videos`, `music`, `home`, `dl`.
+- **`/f`** Explorer-style details table: name, date modified, type, size. **Ctrl+C** copies the path. Empty `/f` lists **Documents, Downloads, Desktop, Pictures, Videos, Music, Home**. Type to search; those folders also match by name. Keywords: `documents`, `downloads`, `desktop`, `pictures`, `videos`, `music`, `home`, `dl`.
 - Tray → **Keep screen awake** (checked / highlighted when on) · Shortcuts / Todos / Settings. Or `/awake` in the prompt.
 
 Special commands start with **`/`**. Short forms: `/t` todo, `/c` clipboard, `/s` screenshot (`/sr` `/sw` `/sf`), `/k` launch (apps/shortcuts/cmd), `/f` files. Everything else is search. `>` still runs a shell line immediately.
@@ -25,7 +25,7 @@ Special commands start with **`/`**. Short forms: `/t` todo, `/c` clipboard, `/s
 
 ## Download
 
-**[Katana 0.2.0 for Windows](https://github.com/rajmenon/katana/releases/latest)** — `Katana-0.2.0-windows-x86_64.exe` (~2.8 MB). Run it; it stays in the tray. **Alt+Space** opens the prompt.
+**[Katana 0.3.0 for Windows](https://github.com/rajmenon/katana/releases/latest)** — `Katana-0.3.0-windows-x86_64.exe` (~2.8 MB). Run it; it stays in the tray. **Alt+Space** opens the prompt.
 
 ## Run
 

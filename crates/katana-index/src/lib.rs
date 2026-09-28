@@ -1,9 +1,10 @@
 //! In-memory filename index. Search never walks the tree.
 
 use std::path::{Path, PathBuf};
+use std::time::UNIX_EPOCH;
 
 use std::cmp::Reverse;
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, HashSet};
 
 use katana_core::FuzzyEngine;
 use thiserror::Error;
@@ -26,6 +27,8 @@ pub struct FileHit {
     pub size: Option<u64>,
     pub is_dir: bool,
     pub type_name: String,
+    /// Unix seconds, last write time. `None` when the index never saw it.
+    pub modified: Option<u64>,
 }
 
 /// Explorer-style type column.
@@ -67,7 +70,15 @@ pub fn type_name_of(name: &str, is_dir: bool) -> String {
     }
 }
 
-/// Explorer-like Date modified (`2026-09-02 13:04`).
+/// Last-write time as unix seconds, if the clock is after the epoch.
+pub fn mtime_unix(meta: &std::fs::Metadata) -> Option<u64> {
+    meta.modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+}
+
+/// Explorer-like Date modified (`2026-09-02 13:04`), UTC.
 pub fn format_mtime(unix_secs: u64) -> String {
     let days = unix_secs / 86400;
     let rem = unix_secs % 86400;
@@ -118,8 +129,13 @@ struct Entry {
     path_off: u32,
     path_len: u32,
     size: u64,
+    modified: u64,
     flags: u16,
 }
+
+const F_DIR: u16 = 1;
+const F_SIZE: u16 = 2;
+const F_MTIME: u16 = 4;
 
 impl NameIndex {
     pub fn new() -> Self {
@@ -167,6 +183,17 @@ impl NameIndex {
     }
 
     pub fn insert_full(&mut self, name: &str, path: &str, size: Option<u64>, is_dir: bool) {
+        self.insert_meta(name, path, size, is_dir, None);
+    }
+
+    pub fn insert_meta(
+        &mut self,
+        name: &str,
+        path: &str,
+        size: Option<u64>,
+        is_dir: bool,
+        modified: Option<u64>,
+    ) {
         if name.is_empty() || path.is_empty() {
             return;
         }
@@ -177,13 +204,24 @@ impl NameIndex {
         self.names.extend_from_slice(&name_b[..name_len]);
         let path_off = self.paths.len() as u32;
         self.paths.extend_from_slice(path_b);
+        let mut flags = 0u16;
+        if is_dir {
+            flags |= F_DIR;
+        }
+        if size.is_some() {
+            flags |= F_SIZE;
+        }
+        if modified.is_some() {
+            flags |= F_MTIME;
+        }
         self.entries.push(Entry {
             name_off,
             name_len: name_len as u16,
             path_off,
             path_len: path_b.len() as u32,
             size: size.unwrap_or(0),
-            flags: if is_dir { 1 } else { 0 } | if size.is_some() { 2 } else { 0 },
+            modified: modified.unwrap_or(0),
+            flags,
         });
     }
 
@@ -206,8 +244,17 @@ impl NameIndex {
 
     fn to_hit(&self, e: &Entry, score: f32) -> FileHit {
         let name = self.name_at(e).to_string();
-        let is_dir = e.flags & 1 != 0;
-        let size = if e.flags & 2 != 0 { Some(e.size) } else { None };
+        let is_dir = e.flags & F_DIR != 0;
+        let size = if e.flags & F_SIZE != 0 {
+            Some(e.size)
+        } else {
+            None
+        };
+        let modified = if e.flags & F_MTIME != 0 {
+            Some(e.modified)
+        } else {
+            None
+        };
         FileHit {
             type_name: type_name_of(&name, is_dir),
             name,
@@ -215,6 +262,7 @@ impl NameIndex {
             score,
             size,
             is_dir,
+            modified,
         }
     }
 
@@ -287,6 +335,7 @@ impl NameIndex {
         }
         let mut ranked: Vec<(u32, u32)> = heap.into_iter().map(|Reverse(v)| v).collect();
         ranked.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        let mut seen = HashSet::new();
         ranked
             .into_iter()
             .filter_map(|(key, idx)| {
@@ -294,6 +343,7 @@ impl NameIndex {
                     .get(idx as usize)
                     .map(|e| self.to_hit(e, key as f32 / 10_000.0))
             })
+            .filter(|h| seen.insert(h.path.to_ascii_lowercase()))
             .collect()
     }
 }
@@ -484,7 +534,8 @@ fn inject_folder_roots(idx: &mut NameIndex, roots: &[PathBuf]) {
             continue;
         }
         if let Some(name) = root.file_name().and_then(|n| n.to_str()) {
-            idx.insert_full(name, &root.to_string_lossy(), None, true);
+            let modified = std::fs::metadata(root).ok().as_ref().and_then(mtime_unix);
+            idx.insert_meta(name, &root.to_string_lossy(), None, true, modified);
         }
     }
 }
@@ -496,16 +547,52 @@ fn boot_drive_letter() -> Option<char> {
         .map(|c| c.to_ascii_uppercase())
 }
 
+/// Drop a root whose files are already reached by walking an ancestor.
+/// Home + Documents would otherwise index every document twice.
+pub fn prepare_roots(roots: &[PathBuf]) -> Vec<PathBuf> {
+    let mut v: Vec<PathBuf> = roots.iter().filter(|p| p.is_dir()).cloned().collect();
+    v.sort_by_key(|p| p.components().count());
+    let mut kept: Vec<PathBuf> = Vec::new();
+    for r in v {
+        if kept.iter().any(|k| root_covered(k.as_path(), &r)) {
+            continue;
+        }
+        kept.push(r);
+    }
+    kept
+}
+
+fn root_covered(ancestor: &Path, child: &Path) -> bool {
+    let Ok(rel) = child.strip_prefix(ancestor) else {
+        return false;
+    };
+    if rel.as_os_str().is_empty() {
+        return false;
+    }
+    let comps: Vec<_> = rel.components().collect();
+    // walk_into_depth stops after 10. A deep extra root is not covered.
+    if comps.is_empty() || comps.len() > 8 {
+        return false;
+    }
+    for c in &comps {
+        if let Some(name) = c.as_os_str().to_str() {
+            if skip_dir(name) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 /// Walk `roots` once and fill an index. Subsequent search does not walk.
 pub fn walk_roots(roots: &[PathBuf]) -> NameIndex {
     let mut idx = NameIndex::new();
-    for root in roots {
+    for root in prepare_roots(roots) {
         if let Some(name) = root.file_name().and_then(|n| n.to_str()) {
-            if root.is_dir() {
-                idx.insert_full(name, &root.to_string_lossy(), None, true);
-            }
+            let modified = std::fs::metadata(&root).ok().as_ref().and_then(mtime_unix);
+            idx.insert_meta(name, &root.to_string_lossy(), None, true, modified);
         }
-        walk_into(&mut idx, root);
+        walk_into(&mut idx, &root);
     }
     idx
 }
@@ -530,8 +617,9 @@ fn walk_into_depth(idx: &mut NameIndex, root: &Path, depth: u8) {
         }
         let meta = ent.metadata().ok();
         let is_dir = meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
+        let modified = meta.as_ref().and_then(mtime_unix);
         let size = meta.and_then(|m| if is_dir { None } else { Some(m.len()) });
-        idx.insert_full(&name, &path.to_string_lossy(), size, is_dir);
+        idx.insert_meta(&name, &path.to_string_lossy(), size, is_dir, modified);
         if is_dir && !skip_dir(&name) {
             walk_into_depth(idx, &path, depth + 1);
         }
@@ -830,6 +918,37 @@ mod tests {
             hits.iter().any(|h| h.name == "alpha-widget.txt"),
             "index must answer from memory, not re-walk; {hits:?}"
         );
+        let dated = hits.iter().find(|h| h.name == "alpha-widget.txt").unwrap();
+        assert!(dated.modified.is_some(), "walk must store last-write time");
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn duplicate_paths_collapse_and_nested_roots_walk_once() {
+        let mut idx = NameIndex::new();
+        idx.insert_meta("a.txt", r"C:\docs\a.txt", Some(3), false, Some(50));
+        idx.insert_meta("a.txt", r"C:\docs\a.txt", Some(3), false, Some(50));
+        let hits = idx.search("a.txt", 5);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].modified, Some(50));
+
+        let parent = std::env::temp_dir().join(format!(
+            "katana-roots-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let child = parent.join("docs");
+        fs::create_dir_all(&child).unwrap();
+        fs::write(child.join("only-once.txt"), b"z").unwrap();
+        let once = walk_roots(&[parent.clone()]);
+        let both = walk_roots(&[parent.clone(), child.clone()]);
+        assert_eq!(
+            once.len(),
+            both.len(),
+            "Documents under Home must not be indexed twice"
+        );
+        let _ = fs::remove_dir_all(parent);
     }
 }

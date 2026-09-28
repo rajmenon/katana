@@ -78,12 +78,29 @@ pub fn search_apps(apps: &[AppEntry], query: &str, limit: usize) -> Vec<Hit> {
     }
     let mut eng = FuzzyEngine::new();
     let pat = FuzzyEngine::prepare(query);
+    let ql = query.trim().to_ascii_lowercase();
     let mut hits = Vec::new();
     for a in apps {
-        let Some(score) = eng.score_prepared(&pat, &a.name) else {
+        let stem = a
+            .path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let mut score = eng.score_prepared(&pat, &a.name);
+        if !stem.is_empty() && !stem.eq_ignore_ascii_case(&a.name) {
+            if let Some(s) = eng.score_prepared(&pat, &stem) {
+                score = Some(score.map(|b| b.max(s)).unwrap_or(s));
+            }
+        }
+        let name_l = a.name.to_ascii_lowercase();
+        let stem_l = stem.to_ascii_lowercase();
+        if !ql.is_empty() && (name_l.contains(&ql) || stem_l.contains(&ql)) {
+            score = Some(score.unwrap_or(0.0).max(0.93));
+        }
+        let Some(score) = score else {
             continue;
         };
-        let exact = a.name.eq_ignore_ascii_case(query);
+        let exact = a.name.eq_ignore_ascii_case(query) || stem.eq_ignore_ascii_case(query);
         hits.push(Hit::new(
             format!("app:{}", a.path.display()),
             a.name.clone(),
@@ -93,6 +110,157 @@ pub fn search_apps(apps: &[AppEntry], query: &str, limit: usize) -> Vec<Hit> {
         ));
     }
     katana_core::merge_hits(hits, limit)
+}
+
+fn push_if_file(out: &mut Vec<AppEntry>, path: PathBuf, name: &str) {
+    if path.is_file() {
+        out.push(AppEntry {
+            name: name.to_string(),
+            path,
+        });
+    }
+}
+
+/// Shells and terminals that are not Start Menu shortcuts and not under crawled folders.
+pub fn builtin_programs() -> Vec<AppEntry> {
+    let mut out = Vec::new();
+    let windir = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+    let win = PathBuf::from(&windir);
+    push_if_file(
+        &mut out,
+        win.join(r"System32\WindowsPowerShell\v1.0\powershell.exe"),
+        "PowerShell",
+    );
+    push_if_file(&mut out, win.join(r"System32\cmd.exe"), "Command Prompt");
+    push_if_file(&mut out, win.join(r"System32\notepad.exe"), "Notepad");
+    if let Ok(local) = std::env::var("LOCALAPPDATA") {
+        push_if_file(
+            &mut out,
+            PathBuf::from(local).join(r"Microsoft\WindowsApps\wt.exe"),
+            "Windows Terminal",
+        );
+    }
+    if let Ok(pf) = std::env::var("ProgramFiles") {
+        push_if_file(
+            &mut out,
+            PathBuf::from(pf).join(r"PowerShell\7\pwsh.exe"),
+            "PowerShell 7",
+        );
+    }
+    out
+}
+
+fn skip_program_dir(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    n == "windowsapps" || n == "winsxs" || katana_index::skip_dir(name)
+}
+
+fn skip_exe_stem(stem: &str) -> bool {
+    let s = stem.to_ascii_lowercase();
+    s.starts_with("unins")
+        || matches!(
+            s.as_str(),
+            "uninstall"
+                | "setup"
+                | "update"
+                | "updater"
+                | "crashpad_handler"
+                | "crashreporter"
+                | "vc_redist"
+        )
+}
+
+/// `.exe` files under Program Files and per-user Programs. Depth-capped.
+/// Does not walk PATH or System32 (that stalls startup and floods results).
+pub fn scan_installed_exes(cap: usize) -> Vec<AppEntry> {
+    let mut dirs = Vec::new();
+    if let Ok(pf) = std::env::var("ProgramFiles") {
+        dirs.push(PathBuf::from(pf));
+    }
+    if let Ok(pf) = std::env::var("ProgramFiles(x86)") {
+        dirs.push(PathBuf::from(pf));
+    }
+    if let Ok(local) = std::env::var("LOCALAPPDATA") {
+        dirs.push(PathBuf::from(local).join("Programs"));
+    }
+    let mut out = Vec::new();
+    for d in dirs {
+        scan_exe_dir(&d, &mut out, 0, 5, cap);
+        if out.len() >= cap {
+            break;
+        }
+    }
+    out
+}
+
+fn scan_exe_dir(dir: &Path, out: &mut Vec<AppEntry>, depth: u8, max_depth: u8, cap: usize) {
+    if out.len() >= cap || depth > max_depth {
+        return;
+    }
+    let rd = match std::fs::read_dir(dir) {
+        Ok(r) => r,
+        Err(_) => return,
+    };
+    let mut subdirs = Vec::new();
+    for ent in rd.flatten() {
+        if out.len() >= cap {
+            break;
+        }
+        let p = ent.path();
+        let name = ent.file_name().to_string_lossy().into_owned();
+        let ft = match ent.file_type() {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        if ft.is_symlink() {
+            continue;
+        }
+        if ft.is_dir() {
+            if !skip_program_dir(&name) {
+                subdirs.push(p);
+            }
+            continue;
+        }
+        let ext = p
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if ext != "exe" {
+            continue;
+        }
+        let stem = p
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or(name);
+        if skip_exe_stem(&stem) {
+            continue;
+        }
+        out.push(AppEntry { name: stem, path: p });
+    }
+    for s in subdirs {
+        scan_exe_dir(&s, out, depth + 1, max_depth, cap);
+        if out.len() >= cap {
+            break;
+        }
+    }
+}
+
+pub fn dedup_apps(apps: &mut Vec<AppEntry>) {
+    let mut seen = std::collections::HashSet::new();
+    apps.retain(|a| {
+        let key = a.path.to_string_lossy().to_ascii_lowercase();
+        seen.insert(key)
+    });
+}
+
+/// Start Menu shortcuts, known shells, and installed executables.
+pub fn collect_programs() -> Vec<AppEntry> {
+    let mut apps = scan_apps(&default_app_dirs());
+    apps.extend(builtin_programs());
+    apps.extend(scan_installed_exes(4000));
+    dedup_apps(&mut apps);
+    apps
 }
 
 #[cfg(test)]
@@ -128,5 +296,68 @@ mod tests {
             "ranking must surface the scanned app: {hits:?}"
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn scan_exes_skips_uninstallers_and_indexes_programs() {
+        let root = std::env::temp_dir().join(format!(
+            "katana-exes-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let app = root.join("Tools").join("bin");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(app.join("widget.exe"), b"MZ").unwrap();
+        std::fs::write(app.join("unins000.exe"), b"MZ").unwrap();
+        std::fs::write(root.join("notes.txt"), b"no").unwrap();
+        let mut found = Vec::new();
+        scan_exe_dir(&root, &mut found, 0, 5, 20);
+        assert!(
+            found.iter().any(|a| a.name == "widget"),
+            "exe must be indexed: {found:?}"
+        );
+        assert!(
+            found.iter().all(|a| a.name != "unins000"),
+            "uninstallers stay out: {found:?}"
+        );
+        let hits = search_apps(&found, "widget", 5);
+        assert!(hits.iter().any(|h| h.title == "widget"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn terminal_matches_by_name_and_powershell_by_stem() {
+        let apps = vec![
+            AppEntry {
+                name: "Windows Terminal".into(),
+                path: PathBuf::from(r"C:\Apps\wt.exe"),
+            },
+            AppEntry {
+                name: "PowerShell".into(),
+                path: PathBuf::from(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"),
+            },
+        ];
+        let term = search_apps(&apps, "terminal", 5);
+        assert!(
+            term.iter().any(|h| h.title == "Windows Terminal"),
+            "{term:?}"
+        );
+        let ps = search_apps(&apps, "powershell", 5);
+        assert!(ps.iter().any(|h| h.title == "PowerShell"), "{ps:?}");
+        let wt = search_apps(&apps, "wt", 5);
+        assert!(wt.iter().any(|h| h.title == "Windows Terminal"), "{wt:?}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn builtin_programs_include_powershell() {
+        let apps = builtin_programs();
+        assert!(
+            apps.iter().any(|a| a.name == "PowerShell"),
+            "powershell.exe should launch without a keyword: {apps:?}"
+        );
+        assert!(apps.iter().any(|a| a.name == "Command Prompt"));
     }
 }

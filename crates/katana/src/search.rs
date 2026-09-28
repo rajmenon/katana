@@ -115,7 +115,7 @@ impl Engine {
                 for f in self.files.search(q, limit) {
                     hits.push(file_hit(f));
                 }
-                merge_hits(hits, limit)
+                merge_hits(dedupe_by_path(hits, true), limit)
             }
             Route::Clip { query } => {
                 let Some(store) = clips else {
@@ -288,7 +288,7 @@ impl Engine {
                 for f in self.files.search(query, limit) {
                     hits.push(file_hit(f));
                 }
-                merge_hits(hits, limit)
+                merge_hits(dedupe_by_path(hits, false), limit)
             }
         }
     }
@@ -423,7 +423,6 @@ fn command_hits() -> Vec<Hit> {
         ("/f", Some('f'), "Search files", HitKind::File),
         ("/awake", None, "Keep screen awake", HitKind::Keyword),
         ("/settings", None, "Settings", HitKind::Keyword),
-        ("g", None, "Google search (no slash)", HitKind::Keyword),
     ]
     .into_iter()
     .map(|(cmd, letter, subtitle, kind)| {
@@ -687,7 +686,7 @@ pub fn blade_footer(q: &str, composing: bool) -> Option<&'static str> {
             Some("↵ capture    /sr region    /sw window    /sf browser    esc back")
         }
         Some("f" | "file" | "files") => {
-            Some("↵ open    ←→ caret    click headers to sort    wheel to scroll    esc back")
+            Some("↵ open    ctrl+c copy path    click headers to sort    esc back")
         }
         Some(
             "apps" | "app" | "a" | "cmd" | "go" | "launch" | "bm" | "b" | "bookmark" | "bookmarks"
@@ -719,7 +718,39 @@ fn file_hit(f: katana_index::FileHit) -> Hit {
     h.size = f.size;
     h.type_name = Some(f.type_name);
     h.is_dir = f.is_dir;
+    h.modified = f.modified;
     h
+}
+
+/// Same path can arrive as a program and as a file. Keep one.
+/// `prefer_file` keeps the file row so `/f` can show date and size.
+fn dedupe_by_path(hits: Vec<Hit>, prefer_file: bool) -> Vec<Hit> {
+    let mut order = Vec::new();
+    let mut map: std::collections::HashMap<String, Hit> = std::collections::HashMap::new();
+    for h in hits {
+        let key = launch_path(&h)
+            .map(|p| p.to_ascii_lowercase())
+            .unwrap_or_else(|| h.id.clone());
+        match map.get(&key) {
+            None => {
+                order.push(key.clone());
+                map.insert(key, h);
+            }
+            Some(prev) => {
+                let replace = if h.kind == prev.kind {
+                    h.score > prev.score
+                } else if prefer_file {
+                    h.kind == HitKind::File
+                } else {
+                    h.kind == HitKind::App
+                };
+                if replace {
+                    map.insert(key, h);
+                }
+            }
+        }
+    }
+    order.into_iter().filter_map(|k| map.remove(&k)).collect()
 }
 
 fn app_hit(a: &AppEntry) -> Hit {
@@ -747,6 +778,40 @@ fn clear_clips_hit() -> Hit {
         1.0,
         HitKind::Clip,
     )
+}
+
+/// Date modified for the file table. Local time on Windows, UTC elsewhere.
+pub fn format_modified(unix_secs: u64) -> String {
+    #[cfg(windows)]
+    {
+        if let Some(s) = format_modified_local(unix_secs) {
+            return s;
+        }
+    }
+    katana_index::format_mtime(unix_secs)
+}
+
+#[cfg(windows)]
+fn format_modified_local(unix_secs: u64) -> Option<String> {
+    use windows::Win32::Foundation::{FILETIME, SYSTEMTIME};
+    use windows::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
+    let ticks = (unix_secs as u64)
+        .checked_add(11_644_473_600)?
+        .checked_mul(10_000_000)?;
+    let ft = FILETIME {
+        dwLowDateTime: ticks as u32,
+        dwHighDateTime: (ticks >> 32) as u32,
+    };
+    let mut utc = SYSTEMTIME::default();
+    let mut local = SYSTEMTIME::default();
+    unsafe {
+        FileTimeToSystemTime(&ft, &mut utc).ok()?;
+        SystemTimeToTzSpecificLocalTime(None, &utc, &mut local).ok()?;
+    }
+    Some(format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}",
+        local.wYear, local.wMonth, local.wDay, local.wHour, local.wMinute
+    ))
 }
 
 pub fn launch_path(h: &Hit) -> Option<String> {
@@ -805,6 +870,10 @@ mod tests {
                 "{names:?}"
             );
             assert!(hits.iter().all(|h| h.is_dir));
+            assert!(
+                hits.iter().any(|h| h.modified.is_some()),
+                "folder rows need a modified time"
+            );
         }
         let (_, dl) = e.search("/f download", None, None, 16);
         assert!(
@@ -833,6 +902,11 @@ mod tests {
         let inv = hits.iter().find(|h| h.title == "invoice.pdf").unwrap();
         assert_eq!(launch_path(inv).as_deref(), Some(r"C:\docs\invoice.pdf"));
         assert_ne!(inv.subtitle, r"C:\docs\invoice.pdf");
+        e.files
+            .insert_meta("dated.pdf", r"C:\docs\dated.pdf", Some(12), false, Some(1_700_000_000));
+        let (_, dated) = e.search("/f dated.pdf", None, None, 8);
+        let dated = dated.iter().find(|h| h.title == "dated.pdf").unwrap();
+        assert_eq!(dated.modified, Some(1_700_000_000));
         e.files.insert_full("report.pdf", r"C:\a\report.pdf", Some(4096), false);
         let (_, wild) = e.search("/f *.pdf", None, None, 8);
         assert!(
@@ -859,7 +933,12 @@ mod tests {
         assert!(!hits.iter().any(|h| h.id == "cmd:/apps" || h.id == "cmd:/cmd"));
         assert!(!hits.iter().any(|h| h.id == "cmd:/bm" || h.id == "cmd:/keywords"));
         assert!(hits.iter().any(|h| h.id == "cmd:/todo"));
+        assert!(
+            !hits.iter().any(|h| h.id == "cmd:g" || h.title == "g"),
+            "g is a keyword, not a home-page row"
+        );
         assert!(blade_footer("", false).is_none());
+        assert!(blade_footer("/f", false).unwrap().contains("copy path"));
         assert!(blade_footer("/todo", false).unwrap().contains("alt+v"));
         assert!(blade_footer("/clip", false).unwrap().contains("paste"));
         assert_eq!(parent_query(""), None);

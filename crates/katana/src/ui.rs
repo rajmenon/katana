@@ -202,6 +202,21 @@ mod win {
             }
             WM_KEYDOWN | WM_SYSKEYDOWN => {
                 let vk = w.0 as u16;
+                if vk == 0x43 && ctrl_down() && !alt_down() {
+                    let copied = STATE.lock().ok().and_then(|g| {
+                        g.as_ref().and_then(|ln| {
+                            if ln.composing() {
+                                None
+                            } else {
+                                ln.copy_selected_path().ok()
+                            }
+                        })
+                    });
+                    if let Some(path) = copied {
+                        tray_info(hwnd, "Path copied", &path);
+                        return LRESULT(0);
+                    }
+                }
                 if vk == VK_V && alt_down() {
                     if let Ok(mut g) = STATE.lock() {
                         if let Some(ln) = g.as_mut() {
@@ -505,6 +520,10 @@ mod win {
 
     fn alt_down() -> bool {
         unsafe { GetKeyState(VK_MENU as i32) as u16 & 0x8000 != 0 }
+    }
+
+    fn ctrl_down() -> bool {
+        unsafe { GetKeyState(0x11) as u16 & 0x8000 != 0 }
     }
 
     fn overlay_height(hits: usize, file_mode: bool, preview: bool, footer: bool) -> i32 {
@@ -1328,7 +1347,7 @@ mod win {
                 };
                 let date = h
                     .modified
-                    .map(katana_index::format_mtime)
+                    .map(crate::search::format_modified)
                     .unwrap_or_default();
                 let date_w: Vec<u16> = date.encode_utf16().collect();
                 let typ_w: Vec<u16> = typ.encode_utf16().collect();

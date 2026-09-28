@@ -8,7 +8,6 @@ use katana_index::NameIndex;
 use katana_shot::{dib_from_bgra, png_from_bgra, PhysRect};
 use katana_todo::{parse_todo_rest, Priority, Status, Store as TodoStore};
 
-use crate::apps::{default_app_dirs, scan_apps};
 use crate::exec::perform;
 use crate::search::Engine;
 
@@ -714,6 +713,19 @@ impl Launcher {
         }
     }
 
+    /// Copy the selected file, folder, or program path. No-op clipboard when `dry_run`.
+    pub fn copy_selected_path(&self) -> Result<String, String> {
+        let hit = self
+            .hits
+            .get(self.selected)
+            .ok_or_else(|| "nothing selected".to_string())?;
+        let path = crate::search::launch_path(hit).ok_or_else(|| "no path".to_string())?;
+        if !self.dry_run {
+            crate::capture::set_clipboard_text(&path)?;
+        }
+        Ok(path)
+    }
+
     pub fn mark_selected_todo_done(&mut self) -> Result<Outcome, String> {
         let id = self.selected_todo_id().ok_or("no todo selected")?;
         let t = self
@@ -911,6 +923,9 @@ fn folder_hit(name: &str, path: &std::path::Path, score: f32) -> Hit {
     );
     h.type_name = Some("File folder".into());
     h.is_dir = true;
+    if let Ok(meta) = std::fs::metadata(path) {
+        h.modified = katana_index::mtime_unix(&meta);
+    }
     h
 }
 
@@ -929,23 +944,62 @@ pub fn crawl_roots() -> Vec<std::path::PathBuf> {
     roots
 }
 
-pub fn rebuild_file_index() -> katana_index::NameIndex {
+fn user_file_index() -> katana_index::NameIndex {
     let roots = crawl_roots();
     let mut idx = katana_index::build_live_index(&roots);
     for (name, path) in well_known_user_folders() {
-        idx.insert_full(&name, &path.to_string_lossy(), None, true);
+        let modified = std::fs::metadata(&path)
+            .ok()
+            .as_ref()
+            .and_then(katana_index::mtime_unix);
+        idx.insert_meta(&name, &path.to_string_lossy(), None, true, modified);
     }
     idx
 }
 
-/// Heavy work: crawl folders + Start Menu. Call off the UI thread.
+fn index_program_exes(idx: &mut katana_index::NameIndex, apps: &[crate::apps::AppEntry]) {
+    for a in apps {
+        let ext = a
+            .path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("");
+        if !ext.eq_ignore_ascii_case("exe") {
+            continue;
+        }
+        let name = a
+            .path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| a.name.clone());
+        let meta = std::fs::metadata(&a.path).ok();
+        let size = meta.as_ref().and_then(|m| {
+            if m.is_file() {
+                Some(m.len())
+            } else {
+                None
+            }
+        });
+        let modified = meta.as_ref().and_then(katana_index::mtime_unix);
+        idx.insert_meta(&name, &a.path.to_string_lossy(), size, false, modified);
+    }
+}
+
+pub fn rebuild_file_index() -> katana_index::NameIndex {
+    let mut idx = user_file_index();
+    index_program_exes(&mut idx, &crate::apps::collect_programs());
+    idx
+}
+
+/// Heavy work: crawl folders + programs. Call off the UI thread.
 pub fn build_indexes() -> (
     NameIndex,
     Vec<crate::apps::AppEntry>,
     Vec<crate::bookmarks::Bookmark>,
 ) {
-    let files = rebuild_file_index();
-    let apps = scan_apps(&default_app_dirs());
+    let apps = crate::apps::collect_programs();
+    let mut files = user_file_index();
+    index_program_exes(&mut files, &apps);
     let bookmarks = crate::bookmarks::load_browser_bookmarks();
     (files, apps, bookmarks)
 }
@@ -1244,6 +1298,16 @@ mod tests {
         }
         assert_ne!(crate::keepawake::is_on(), start);
         crate::keepawake::set(start);
+    }
+
+    #[test]
+    fn copy_selected_file_path() {
+        let mut l = launch();
+        l.set_query("/f invoice");
+        let path = l.copy_selected_path().unwrap();
+        assert!(path.ends_with("invoice.pdf"), "{path}");
+        l.selected = 99;
+        assert!(l.copy_selected_path().is_err());
     }
 
     #[test]

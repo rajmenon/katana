@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.3.0 — 2026-09-28
+
+### Files (`/f`)
+- **Date modified** shows for files and folders, in local time
+- **Ctrl+C** copies the full path of the selected file, folder, or program
+- A file inside two crawled folders (Home and Documents) is listed once
+
+### Launch
+- Installed `.exe` files are indexed from Program Files and `%LOCALAPPDATA%\Programs`
+- **PowerShell**, **Windows Terminal**, **Command Prompt**, and **Notepad** launch by name. No keyword required
+- `g` is no longer on the home command list. `g rust` still searches Google
+
 ## 0.2.0 — 2026-09-08
 
 Windows tray swiss knife. **Alt+Space** still opens the prompt.

@@ -12,6 +12,11 @@ Do **not** implement these until a batch is started.
 - Clipboard global hotkey **Win+Alt+C**, paste into last focused field, reliable image preview
 - File search global hotkey **Win+Alt+Space**, Explorer-style details table
 - Screenshot options `/sr` region, `/sw` window, `/sf` browser page; clipboard + Pictures\\Katana
+- `/f` Date modified for files and folders
+- Ctrl+C copies the path of the selected file, folder, or program
+- Installed `.exe` files indexed from Program Files and per-user Programs
+- Launch PowerShell, Windows Terminal, Command Prompt, and Notepad by name, no keyword
+- `g` removed from the home command list (`g rust` still searches Google)
 
 ## Open
 
