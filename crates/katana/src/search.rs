@@ -93,7 +93,11 @@ impl Engine {
             }
             Route::Keyword { name, arg } => {
                 if let Some(kw) = find_keyword(&self.keywords, name) {
-                    let hint = arg.clone().unwrap_or_default();
+                    let hint = match arg {
+                        Some(a) if !a.is_empty() => a.clone(),
+                        _ if kw.url.is_some() => "ctrl+v pastes the search".into(),
+                        _ => String::new(),
+                    };
                     vec![Hit::new(
                         format!("kw:{name}"),
                         kw.names[0].clone(),
@@ -169,6 +173,16 @@ impl Engine {
                 let Some(store) = todos else {
                     return Vec::new();
                 };
+                if rest.trim_start().starts_with('/') {
+                    let tasks = match katana_todo::parse_progress_filter(rest) {
+                        Some(katana_todo::ProgressFilter::All) => store.list_all().unwrap_or_default(),
+                        Some(katana_todo::ProgressFilter::Range { lo, hi }) => {
+                            store.list_progress(lo, hi).unwrap_or_default()
+                        }
+                        Some(katana_todo::ProgressFilter::Rejected) | None => Vec::new(),
+                    };
+                    return tasks.into_iter().map(todo_hit).collect();
+                }
                 let (verb, arg) = katana_todo::parse_todo_rest(rest);
                 let tasks = match verb {
                     "list" | "l" | "" => store.list_active().unwrap_or_default(),
@@ -205,23 +219,7 @@ impl Engine {
                         }
                     }
                 };
-                tasks
-                    .into_iter()
-                    .map(|t| {
-                        Hit::new(
-                            format!("todo:{}", t.id),
-                            t.title,
-                            format!(
-                                "#{} · {} · {}",
-                                t.id,
-                                katana_todo::format_progress(t.progress),
-                                t.status.replace('_', " ")
-                            ),
-                            1.0,
-                            HitKind::Todo,
-                        )
-                    })
-                    .collect()
+                tasks.into_iter().map(todo_hit).collect()
             }
             Route::KeepAwake => {
                 let on = crate::keepawake::is_on();
@@ -419,8 +417,6 @@ fn command_hits() -> Vec<Hit> {
         ("/todo", Some('t'), "Tasks", HitKind::Todo),
         ("/clip", Some('c'), "Clipboard history", HitKind::Clip),
         ("/shot", Some('s'), "Screenshot", HitKind::Shot),
-        ("/k", Some('k'), "Apps, shortcuts, run command", HitKind::Keyword),
-        ("/f", Some('f'), "Search files", HitKind::File),
         ("/awake", None, "Keep screen awake", HitKind::Keyword),
         ("/settings", None, "Settings", HitKind::Keyword),
     ]
@@ -527,6 +523,22 @@ pub const FILE_SEARCH_LIMIT: usize = 64;
 
 pub fn clamp_caret(len: usize, caret: usize) -> usize {
     caret.min(len)
+}
+
+pub fn insert_str_at(s: &str, caret: usize, extra: &str) -> (String, usize) {
+    let n = s.chars().count();
+    let caret = caret.min(n);
+    let mut out = String::with_capacity(s.len() + extra.len());
+    for (i, c) in s.chars().enumerate() {
+        if i == caret {
+            out.push_str(extra);
+        }
+        out.push(c);
+    }
+    if caret == n {
+        out.push_str(extra);
+    }
+    (out, caret + extra.chars().count())
 }
 
 pub fn insert_at(s: &str, caret: usize, ch: char) -> (String, usize) {
@@ -663,7 +675,9 @@ pub fn todo_list_mode(q: &str) -> bool {
         return false;
     }
     let rest = q.trim().split_once(char::is_whitespace).map(|(_, r)| r.trim()).unwrap_or("");
-    rest.is_empty() || matches!(rest, "showall" | "all" | "show-all")
+    rest.is_empty()
+        || rest.starts_with('/')
+        || matches!(rest, "showall" | "all" | "show-all")
 }
 
 /// Blade footer, or `None` on home (no leftover tool hints).
@@ -675,7 +689,7 @@ pub fn blade_footer(q: &str, composing: bool) -> Option<&'static str> {
         return Some(if composing {
             "↵ save    esc cancel"
         } else {
-            "+ add    ↵ edit    % progress    alt+v done    esc back"
+            "+ add    ↵ edit    % progress    / 0..100    alt+v done    esc back"
         });
     }
     if is_clip_blade(q) {
@@ -696,6 +710,21 @@ pub fn blade_footer(q: &str, composing: bool) -> Option<&'static str> {
         Some(_) => Some("esc back"),
         None => Some("↵ open    esc hide    ↑↓ select"),
     }
+}
+
+fn todo_hit(t: katana_todo::Task) -> Hit {
+    Hit::new(
+        format!("todo:{}", t.id),
+        t.title,
+        format!(
+            "#{} · {} · {}",
+            t.id,
+            katana_todo::format_progress(t.progress),
+            t.status.replace('_', " ")
+        ),
+        1.0,
+        HitKind::Todo,
+    )
 }
 
 fn parent_label(path: &str) -> String {
@@ -929,7 +958,10 @@ mod tests {
         assert!(matches!(r, Route::Recents));
         assert!(hits.iter().any(|h| h.title == "/[t]odo"), "{:?}", hits.iter().map(|h| &h.title).collect::<Vec<_>>());
         assert!(hits.iter().any(|h| h.title == "/[s]hot"));
-        assert!(hits.iter().any(|h| h.id == "cmd:/k"));
+        assert!(
+            !hits.iter().any(|h| h.id == "cmd:/k" || h.id == "cmd:/f"),
+            "home hides /k and /f; type them"
+        );
         assert!(!hits.iter().any(|h| h.id == "cmd:/apps" || h.id == "cmd:/cmd"));
         assert!(!hits.iter().any(|h| h.id == "cmd:/bm" || h.id == "cmd:/keywords"));
         assert!(hits.iter().any(|h| h.id == "cmd:/todo"));
@@ -1034,7 +1066,49 @@ mod tests {
         assert!(matches!(e.route_str("/a"), Route::Launch { .. }));
         assert!(matches!(e.route_str("/cmd"), Route::Launch { .. }));
         assert!(is_todo_blade("/t showall") && todo_list_mode("/todo showall"));
+        assert!(todo_list_mode("/todo /0..10") && todo_list_mode("/todo /"));
         assert!(!todo_list_mode("/todo add milk"));
+        assert!(blade_footer("/todo", false).unwrap().contains("/ 0..100"));
+    }
+
+    #[test]
+    fn todo_slash_filters_progress_including_completed() {
+        let path = std::env::temp_dir().join(format!(
+            "katana-search-todo-{}.db",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let store = katana_todo::Store::open(&path).unwrap();
+        let low = store
+            .add("low", "", katana_todo::Priority::Medium, katana_todo::Status::Pending, 0, "[]", None)
+            .unwrap();
+        let done = store
+            .add("done-title-0..10", "", katana_todo::Priority::Medium, katana_todo::Status::Pending, 0, "[]", None)
+            .unwrap();
+        store.set_progress(low.id, 4).unwrap();
+        store.set_progress(done.id, 100).unwrap();
+        let e = eng();
+        let (_, active) = e.search("/todo", Some(&store), None, 16);
+        assert!(active.iter().any(|h| h.title == "low"));
+        assert!(!active.iter().any(|h| h.id == format!("todo:{}", done.id)));
+        let (_, all) = e.search("/todo /", Some(&store), None, 16);
+        assert!(all.iter().any(|h| h.title == "done-title-0..10"));
+        let (_, band) = e.search("/todo /0..10", Some(&store), None, 16);
+        assert_eq!(band.len(), 1);
+        assert_eq!(band[0].title, "low");
+        let (_, exact) = e.search("/todo /100", Some(&store), None, 16);
+        assert_eq!(exact.len(), 1);
+        assert!(exact[0].title.starts_with("done-title"));
+        let (_, open) = e.search("/todo /10..", Some(&store), None, 16);
+        assert_eq!(open.len(), 1);
+        let (_, junk) = e.search("/todo /;drop", Some(&store), None, 16);
+        assert!(junk.is_empty(), "junk filter matches nothing, not titles");
+        drop(store);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
     }
 
     #[test]

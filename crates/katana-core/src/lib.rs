@@ -8,11 +8,12 @@ mod tokens;
 
 pub use calc::{eval_calc, CalcError};
 pub use keyword::{
-    classify_command, default_keywords, find_keyword, resolve_keyword, Keyword, ResolvedAction,
+    classify_command, default_keywords, find_keyword, is_safe_http_url, paste_url_arg,
+    resolve_keyword, Keyword, ResolvedAction,
 };
 pub use query::{route, parse_shot_rest, Query, Route, ShotMode};
 pub use rank::{fuzzy_score, merge_hits, score_hit, FuzzyEngine, Hit, HitKind, PreparedQuery};
-pub use tokens::expand_tokens;
+pub use tokens::{expand_tokens, sanitize_url_arg};
 
 /// First `/verb` of a palette query, without the slash. `"/todo showall"` → `Some("todo")`.
 pub fn slash_verb(raw: &str) -> Option<&str> {

@@ -1,4 +1,4 @@
-use crate::tokens::{expand_tokens, split_steps};
+use crate::tokens::{expand_tokens, expand_url, sanitize_url_arg, split_steps};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Keyword {
@@ -132,8 +132,12 @@ pub fn resolve_keyword(kw: &Keyword, arg: Option<&str>, clipboard: &str) -> Vec<
     }
 
     if let Some(url) = &kw.url {
-        let exp = expand_tokens(url, arg, clipboard);
-        return vec![classify_command(&exp, false)];
+        let exp = expand_url(url, arg, clipboard);
+        if is_safe_http_url(&exp) {
+            return vec![ResolvedAction::OpenUrl(exp)];
+        }
+        // Never fall through to a shell. A URL keyword stays a URL.
+        return Vec::new();
     }
 
     if let Some(cmd) = &kw.command {
@@ -259,6 +263,97 @@ pub fn find_keyword<'a>(kws: &'a [Keyword], verb: &str) -> Option<&'a Keyword> {
     kws.iter().find(|k| k.matches(verb))
 }
 
+/// `http`/`https` only. ASCII URL bytes, no controls, quotes, or `|<>\`, at most 2048 bytes.
+/// Opened with ShellExecute, not `cmd /C`, so `&` stays inside the address.
+pub fn is_safe_http_url(url: &str) -> bool {
+    let b = url.as_bytes();
+    if b.len() < 8 || b.len() > 2048 {
+        return false;
+    }
+    if !b.iter().copied().all(is_url_byte) {
+        return false;
+    }
+    let rest = if url.len() >= 8 && url.as_bytes()[..8].eq_ignore_ascii_case(b"https://") {
+        &url[8..]
+    } else if url.len() >= 7 && url.as_bytes()[..7].eq_ignore_ascii_case(b"http://") {
+        &url[7..]
+    } else {
+        return false;
+    };
+    let host = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if host.is_empty() || host.starts_with('.') || host.ends_with('.') || host.contains("..") {
+        return false;
+    }
+    host.bytes().any(|c| c.is_ascii_alphanumeric())
+}
+
+fn is_url_byte(c: u8) -> bool {
+    matches!(
+        c,
+        b'A'..=b'Z'
+            | b'a'..=b'z'
+            | b'0'..=b'9'
+            | b'-'
+            | b'_'
+            | b'.'
+            | b'~'
+            | b':'
+            | b'/'
+            | b'?'
+            | b'#'
+            | b'['
+            | b']'
+            | b'@'
+            | b'!'
+            | b'$'
+            | b'&'
+            | b'\''
+            | b'('
+            | b')'
+            | b'*'
+            | b'+'
+            | b','
+            | b';'
+            | b'%'
+            | b'='
+    )
+}
+
+/// Append sanitized clipboard text after a URL keyword. The verb is unchanged.
+/// `None` for shell keywords, slash blades, and empty paste.
+pub fn paste_url_arg(query: &str, kws: &[Keyword], raw: &str) -> Option<String> {
+    let trimmed = query.trim();
+    if trimmed.is_empty() || trimmed.starts_with(['/', '>', '=', '#']) {
+        return None;
+    }
+    let (verb, rest) = crate::split_verb(trimmed);
+    let verb = verb?;
+    let kw = find_keyword(kws, verb)?;
+    // Only the URL branch. Steps and paths still expand `$P$` raw, so paste stays out.
+    if kw.url.is_none() || kw.steps.is_some() || kw.path.is_some() {
+        return None;
+    }
+    let arg = sanitize_url_arg(raw);
+    if arg.is_empty() {
+        return None;
+    }
+    const MAX: usize = 600;
+    let prefix = if rest.is_empty() {
+        format!("{verb} ")
+    } else {
+        format!("{verb} {rest} ")
+    };
+    let used = prefix.chars().count();
+    if used >= MAX {
+        return None;
+    }
+    let arg: String = arg.chars().take(MAX - used).collect();
+    if arg.is_empty() {
+        return None;
+    }
+    Some(format!("{prefix}{arg}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -319,6 +414,89 @@ mod tests {
             }
             other => panic!("expected workflow, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn url_keyword_encodes_paste_and_never_shells() {
+        let g = &default_keywords()[0];
+        let acts = resolve_keyword(g, Some("rust crates & calc"), "");
+        match &acts[0] {
+            ResolvedAction::OpenUrl(u) => {
+                assert!(u.starts_with("https://www.google.com/search?q="), "{u}");
+                assert!(u.contains("%26"), "{u}");
+                assert!(is_safe_http_url(u), "{u}");
+            }
+            other => panic!("{other:?}"),
+        }
+        let raw = Keyword {
+            names: vec!["bad".into()],
+            url: Some("$P$".into()),
+            path: None,
+            args: None,
+            steps: None,
+            command: None,
+        };
+        assert!(resolve_keyword(&raw, Some("calc.exe"), "").is_empty());
+        let injected = Keyword {
+            names: vec!["q".into()],
+            url: Some("https://example.com/search?q=$P$&safe=1".into()),
+            path: None,
+            args: None,
+            steps: None,
+            command: None,
+        };
+        let acts = resolve_keyword(&injected, Some("a&b | calc.exe"), "ignored");
+        match &acts[0] {
+            ResolvedAction::OpenUrl(u) => {
+                assert_eq!(
+                    u,
+                    "https://example.com/search?q=a%26b%20%7C%20calc.exe&safe=1"
+                );
+                assert!(is_safe_http_url(u));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn paste_appends_only_after_a_url_keyword() {
+        let kws = default_keywords();
+        assert_eq!(
+            paste_url_arg("g", &kws, "rust\r\ncrates").as_deref(),
+            Some("g rust crates")
+        );
+        assert_eq!(
+            paste_url_arg("g rust", &kws, " crates").as_deref(),
+            Some("g rust crates")
+        );
+        assert_eq!(paste_url_arg("ps", &kws, "Get-Process"), None);
+        let mixed = Keyword {
+            names: vec!["mix".into()],
+            url: Some("https://example.com/?q=$U$".into()),
+            path: None,
+            args: None,
+            steps: Some(vec!["powershell -Command $P$".into()]),
+            command: None,
+        };
+        assert_eq!(paste_url_arg("mix", &[mixed], "calc"), None);
+        assert_eq!(paste_url_arg("> dir", &kws, "calc"), None);
+        assert_eq!(paste_url_arg("/f", &kws, "secret"), None);
+        assert_eq!(paste_url_arg("g", &kws, "\n\t"), None);
+        let pasted = paste_url_arg("g", &kws, "> calc & whoami").unwrap();
+        assert!(pasted.starts_with("g "));
+        assert!(!pasted.contains('\n'));
+    }
+
+    #[test]
+    fn safe_url_rejects_schemes_and_breaks() {
+        assert!(is_safe_http_url("https://example.com/search?q=a%20b"));
+        assert!(is_safe_http_url("http://localhost/x"));
+        assert!(!is_safe_http_url("javascript:alert(1)"));
+        assert!(!is_safe_http_url("https://example.com/a b"));
+        assert!(!is_safe_http_url("https://example.com/a|calc"));
+        assert!(!is_safe_http_url("https://example.com/a\n"));
+        assert!(!is_safe_http_url("https://"));
+        assert!(!is_safe_http_url(&format!("https://example.com/{}", "a".repeat(3000))));
     }
 
     #[test]

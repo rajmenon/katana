@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.3.2 — 2026-10-01
+
+### Home
+- `/k` and `/f` are no longer on the home list. Type them; Win+Alt+Space still opens files
+
+### Keywords
+- **Ctrl+V** (or Shift+Insert) after a URL keyword pastes the search. The text is percent-encoded into the address
+- URL keywords open with the shell, not `cmd /C`, so a pasted `&` cannot start another program
+- Paste is ignored for shell keywords (`ps`), `>`, and shortcuts that launch a program
+
+### Todo
+- `/` filters by progress and includes completed tasks: `/`, `/0..10`, `/10..`, `/50..`, `/100`, `/45..85`, `/..50`
+- `%` still sets progress on the selected task
+- Junk or an inverted range matches nothing. The bounds are bound parameters, not part of the SQL text
+- `katana todo /100` is the same filter on the command line
+
 ## 0.3.1 — 2026-09-28
 
 ### Files (`/f`)

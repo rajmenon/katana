@@ -233,7 +233,7 @@ dependencies = [
 
 [[package]]
 name = "katana"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "katana-clip",
  "katana-core",
@@ -249,7 +249,7 @@ dependencies = [
 
 [[package]]
 name = "katana-clip"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "katana-core",
  "rusqlite",
@@ -258,7 +258,7 @@ dependencies = [
 
 [[package]]
 name = "katana-core"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "nucleo-matcher",
  "thiserror",
@@ -266,7 +266,7 @@ dependencies = [
 
 [[package]]
 name = "katana-index"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "katana-core",
  "regex",
@@ -276,7 +276,7 @@ dependencies = [
 
 [[package]]
 name = "katana-shot"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "katana-core",
  "miniz_oxide",
@@ -285,7 +285,7 @@ dependencies = [
 
 [[package]]
 name = "katana-todo"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "rusqlite",
  "thiserror",

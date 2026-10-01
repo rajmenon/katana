@@ -17,6 +17,9 @@ Do **not** implement these until a batch is started.
 - Installed `.exe` files indexed from Program Files and per-user Programs
 - Launch PowerShell, Windows Terminal, Command Prompt, and Notepad by name, no keyword
 - `g` removed from the home command list (`g rust` still searches Google)
+- Home command list hides `/k` and `/f` (both still work when typed)
+- Ctrl+V after a URL keyword pastes the search; the argument is encoded, not run
+- Todo `/` progress filter (`0..10`, `10..`, `100`, `45..85`) includes completed tasks
 
 ## Open
 

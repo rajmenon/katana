@@ -36,20 +36,15 @@ pub fn open_in_shell(path: &std::path::Path) -> Result<(), String> {
 }
 
 fn open_url(url: &str) -> Result<(), String> {
+    if !katana_core::is_safe_http_url(url) {
+        return Err("refusing to open that url".into());
+    }
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x08000000;
-        std::process::Command::new("cmd")
-            .args(["/C", "start", "", url])
-            .creation_flags(CREATE_NO_WINDOW)
-            .spawn()
-            .map_err(|e| e.to_string())?;
-        return Ok(());
+        return shell_open(url, &[]);
     }
     #[cfg(not(windows))]
     {
-        let _ = url;
         Err("open_url is Windows-only".into())
     }
 }

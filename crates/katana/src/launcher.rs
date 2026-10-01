@@ -242,6 +242,47 @@ impl Launcher {
         self.write_edit_buf(s, c);
     }
 
+    fn insert_str_at_caret(&mut self, extra: &str) {
+        let (s, c) = crate::search::insert_str_at(&self.edit_buf(), self.caret, extra);
+        self.write_edit_buf(s, c);
+    }
+
+    /// Paste clipboard text after a URL keyword, or into a todo compose field.
+    /// Does not run the text. Returns false when paste is refused.
+    pub fn paste_keyword_arg(&mut self, raw: &str) -> bool {
+        if self.composing() {
+            return self.paste_into_compose(raw);
+        }
+        let Some(q) = katana_core::paste_url_arg(&self.query, &self.engine.keywords, raw) else {
+            return false;
+        };
+        self.set_query(&q);
+        true
+    }
+
+    fn paste_into_compose(&mut self, raw: &str) -> bool {
+        let clean = katana_core::sanitize_url_arg(raw);
+        if clean.is_empty() || self.todo_input.is_none() {
+            return false;
+        }
+        if matches!(self.todo_input, Some(TodoInput::Progress { .. })) {
+            let compact: String = clean
+                .chars()
+                .filter(|c| c.is_ascii_digit() || *c == '%')
+                .collect();
+            if compact.is_empty()
+                || compact.chars().filter(|c| *c == '%').count() > 1
+                || katana_todo::parse_percent(&compact).is_none()
+            {
+                return false;
+            }
+            self.insert_str_at_caret(&compact);
+            return true;
+        }
+        self.insert_str_at_caret(&clean);
+        true
+    }
+
     pub fn backspace_at_caret(&mut self) {
         let (s, c) = crate::search::backspace_at(&self.edit_buf(), self.caret);
         self.write_edit_buf(s, c);
@@ -318,6 +359,9 @@ impl Launcher {
                     .and_then(|c| c.text)
                     .unwrap_or_default();
                 let acts = resolve_keyword(kw, arg.as_deref(), &clip);
+                if acts.is_empty() {
+                    return Err("won't open that".into());
+                }
                 let mut msgs = Vec::new();
                 for a in &acts {
                     match self.run_action(a)? {
@@ -411,6 +455,10 @@ impl Launcher {
     }
 
     fn execute_todo(&mut self, rest: &str) -> Result<Outcome, String> {
+        if rest.trim_start().starts_with('/') {
+            self.set_query(&format!("/todo {}", rest.trim()));
+            return Ok(Outcome::Listed(self.hits.clone()));
+        }
         let (verb, arg) = parse_todo_rest(rest);
         match verb {
             "add" | "a" => {
@@ -604,6 +652,8 @@ impl Launcher {
             .unwrap_or("");
         if matches!(rest, "showall" | "all" | "show-all") {
             "/todo showall".into()
+        } else if rest.starts_with('/') {
+            format!("/todo {rest}")
         } else {
             "/todo".into()
         }
@@ -620,6 +670,20 @@ impl Launcher {
     pub fn begin_todo_add(&mut self) {
         self.todo_input = Some(TodoInput::Add { buf: String::new() });
         self.caret = 0;
+    }
+
+    /// Start a progress filter. `/` stays the search key; `%` still edits one task.
+    pub fn begin_todo_filter(&mut self) {
+        let rest = self
+            .query
+            .trim()
+            .split_once(char::is_whitespace)
+            .map(|(_, r)| r.trim())
+            .unwrap_or("");
+        if rest.starts_with('/') {
+            return;
+        }
+        self.set_query("/todo /");
     }
 
     pub fn begin_todo_edit(&mut self) {
@@ -1140,6 +1204,56 @@ mod tests {
         l.go_home();
         assert!(l.query.is_empty());
         assert!(l.hits.iter().any(|h| h.id == "cmd:/todo"));
+    }
+
+    #[test]
+    fn paste_after_keyword_and_todo_progress_filter() {
+        let mut l = launch();
+        l.set_query("g");
+        assert!(l.paste_keyword_arg("rust crates\r\n& calc"));
+        assert_eq!(l.query, "g rust crates & calc");
+        let ran = l.execute_current().unwrap();
+        match ran {
+            Outcome::Ran(s) => {
+                assert!(s.contains("OpenUrl"), "{s}");
+                assert!(s.contains("%26"), "{s}");
+                assert!(!s.contains("Shell"), "{s}");
+            }
+            other => panic!("{other:?}"),
+        }
+        l.set_query("ps");
+        assert!(!l.paste_keyword_arg("Get-Process"));
+        assert_eq!(l.query, "ps");
+        l.set_query("> notepad");
+        assert!(!l.paste_keyword_arg("calc"));
+        assert_eq!(l.query, "> notepad");
+
+        l.set_query("/todo");
+        l.begin_todo_add();
+        l.paste_keyword_arg("Ship it");
+        l.commit_todo_input().unwrap();
+        l.set_query("/todo");
+        l.mark_selected_todo_done().unwrap();
+        l.set_query("/todo");
+        assert!(
+            !l.hits.iter().any(|h| h.title == "Ship it"),
+            "completed leaves the default list"
+        );
+        l.begin_todo_filter();
+        assert_eq!(l.query, "/todo /");
+        l.insert_at_caret('1');
+        l.insert_at_caret('0');
+        l.insert_at_caret('0');
+        assert_eq!(l.query, "/todo /100");
+        assert!(
+            l.hits.iter().any(|h| h.title == "Ship it"),
+            "filter /100 shows completed: {:?}",
+            l.hits
+        );
+        l.set_query("/todo /0..10");
+        assert!(l.hits.iter().all(|h| h.title != "Ship it"));
+        l.begin_todo_filter();
+        assert_eq!(l.query, "/todo /0..10", "a second slash does not reset the filter");
     }
 
     #[test]

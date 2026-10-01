@@ -1,6 +1,6 @@
 use std::io::{self, Write};
 
-use katana_todo::{Priority, Status, Store, Task};
+use katana_todo::{parse_progress_filter, Priority, ProgressFilter, Status, Store, Task};
 
 pub fn run(args: &[String]) -> i32 {
     let cmd = args.first().map(String::as_str).unwrap_or("list");
@@ -21,6 +21,38 @@ fn open_store() -> Result<Store, Box<dyn std::error::Error>> {
 
 fn parse_id(s: &str) -> Result<i64, Box<dyn std::error::Error>> {
     Ok(s.parse::<i64>()?)
+}
+
+fn print_progress_filter(
+    store: &Store,
+    cmd: &str,
+    rest: &[String],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let spec = if cmd == "/" {
+        rest.join(" ")
+    } else {
+        let mut s = cmd[1..].to_string();
+        if !rest.is_empty() {
+            s.push(' ');
+            s.push_str(&rest.join(" "));
+        }
+        s
+    };
+    let tasks = match parse_progress_filter(&format!("/{spec}")) {
+        Some(ProgressFilter::All) => store.list_all()?,
+        Some(ProgressFilter::Range { lo, hi }) => store.list_progress(lo, hi)?,
+        Some(ProgressFilter::Rejected) | None => {
+            return Err("progress filter: / 0..10, 10.., ..50, or 100".into());
+        }
+    };
+    if tasks.is_empty() {
+        println!("(no tasks)");
+    } else {
+        for t in &tasks {
+            print_task(t);
+        }
+    }
+    Ok(())
 }
 
 fn print_task(t: &Task) {
@@ -156,6 +188,9 @@ fn dispatch(cmd: &str, rest: &[String]) -> Result<(), Box<dyn std::error::Error>
         "version" | "v" => {
             println!("katana todo {}", env!("CARGO_PKG_VERSION"));
             println!("Database: {}", katana_todo::default_db_path().display());
+        }
+        filter if filter.starts_with('/') => {
+            print_progress_filter(&store, filter, rest)?;
         }
         other => return Err(format!("unknown command '{other}'").into()),
     }

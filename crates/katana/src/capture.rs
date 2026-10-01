@@ -556,6 +556,44 @@ pub fn set_clipboard_text(_text: &str) -> Result<(), String> {
     Err("clipboard write is Windows-only".into())
 }
 
+/// Read clipboard text, capped. `None` when the clipboard has no text.
+#[cfg(windows)]
+pub fn read_clipboard_text(max_chars: usize) -> Option<String> {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::System::DataExchange::{CloseClipboard, GetClipboardData, OpenClipboard};
+    use windows::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
+    const CF_UNICODETEXT: u32 = 13;
+    let max_chars = max_chars.clamp(1, 8192);
+    unsafe {
+        if OpenClipboard(HWND(std::ptr::null_mut())).is_err() {
+            return None;
+        }
+        let text = GetClipboardData(CF_UNICODETEXT).ok().and_then(|h| {
+            let hg = windows::Win32::Foundation::HGLOBAL(h.0);
+            let p = GlobalLock(hg);
+            if p.is_null() {
+                return None;
+            }
+            let units = (GlobalSize(hg) / 2).min(max_chars.saturating_add(1));
+            let ptr = p.cast::<u16>();
+            let mut n = 0usize;
+            while n < units && *ptr.add(n) != 0 {
+                n += 1;
+            }
+            let s = String::from_utf16_lossy(std::slice::from_raw_parts(ptr, n));
+            let _ = GlobalUnlock(hg);
+            Some(s)
+        });
+        let _ = CloseClipboard();
+        text
+    }
+}
+
+#[cfg(not(windows))]
+pub fn read_clipboard_text(_max_chars: usize) -> Option<String> {
+    None
+}
+
 pub fn clamp_region(x0: i32, y0: i32, x1: i32, y1: i32) -> Option<PhysRect> {
     let x = x0.min(x1);
     let y = y0.min(y1);

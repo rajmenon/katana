@@ -268,6 +268,20 @@ impl Store {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    /// Inclusive progress range. Bounds are integers 0–100; the query text is never interpolated.
+    pub fn list_progress(&self, lo: i64, hi: i64) -> Result<Vec<Task>, TodoError> {
+        if !(0..=100).contains(&lo) || !(0..=100).contains(&hi) || lo > hi {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT id, title, description, status, priority, progress, tags, due_date, position
+             FROM tasks WHERE progress BETWEEN ?1 AND ?2
+             ORDER BY position ASC, id ASC",
+        )?;
+        let rows = stmt.query_map(params![lo, hi], row_task)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     pub fn search(&self, q: &str) -> Result<Vec<Task>, TodoError> {
         let like = format!("%{q}%");
         let mut stmt = self.conn.prepare(
@@ -500,6 +514,65 @@ pub fn percent_from_label(s: &str) -> Option<i64> {
     head[start..].parse::<i64>().ok().map(|n| n.clamp(0, 100))
 }
 
+/// Progress filter introduced by `/` inside the todo blade.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProgressFilter {
+    /// `/` with no range — every task, including completed.
+    All,
+    /// Inclusive bounds, each in 0..=100.
+    Range { lo: i64, hi: i64 },
+    /// Looked like a filter but was not a range. Match nothing.
+    Rejected,
+}
+
+/// `/`, `/ 0..10`, `/10..`, `/..50`, `/100`, `/45..85`.
+/// `None` when `rest` is not a `/` filter (so other todo verbs still work).
+pub fn parse_progress_filter(rest: &str) -> Option<ProgressFilter> {
+    let spec = rest.trim().strip_prefix('/')?.trim();
+    if spec.is_empty() {
+        return Some(ProgressFilter::All);
+    }
+    Some(match parse_progress_range(spec) {
+        Some((lo, hi)) => ProgressFilter::Range { lo, hi },
+        None => ProgressFilter::Rejected,
+    })
+}
+
+fn parse_progress_range(spec: &str) -> Option<(i64, i64)> {
+    if let Some(n) = parse_progress_bound(spec) {
+        return Some((n, n));
+    }
+    let (a, b) = spec.split_once("..")?;
+    if b.contains("..") {
+        return None;
+    }
+    let a = a.trim();
+    let b = b.trim();
+    let lo = if a.is_empty() { 0 } else { parse_progress_bound(a)? };
+    let hi = if b.is_empty() {
+        100
+    } else {
+        parse_progress_bound(b)?
+    };
+    if lo > hi {
+        None
+    } else {
+        Some((lo, hi))
+    }
+}
+
+fn parse_progress_bound(s: &str) -> Option<i64> {
+    if s.is_empty() || s.len() > 3 || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let n: i64 = s.parse().ok()?;
+    if (0..=100).contains(&n) {
+        Some(n)
+    } else {
+        None
+    }
+}
+
 /// Palette helper: parse `todo` rest into a verb + remainder.
 pub fn parse_todo_rest(rest: &str) -> (&str, &str) {
     let rest = rest.trim();
@@ -614,6 +687,93 @@ mod tests {
         assert_eq!(parse_percent("half"), None);
         assert_eq!(percent_from_label("#3 · 40% · in progress"), Some(40));
         assert_eq!(percent_from_label("no percent"), None);
+    }
+
+    #[test]
+    fn progress_filter_bounds_and_rejects_junk() {
+        assert_eq!(parse_progress_filter("/"), Some(ProgressFilter::All));
+        assert_eq!(parse_progress_filter("/   "), Some(ProgressFilter::All));
+        assert_eq!(
+            parse_progress_filter("/ 0..10"),
+            Some(ProgressFilter::Range { lo: 0, hi: 10 })
+        );
+        assert_eq!(
+            parse_progress_filter("/10.."),
+            Some(ProgressFilter::Range { lo: 10, hi: 100 })
+        );
+        assert_eq!(
+            parse_progress_filter("/..50"),
+            Some(ProgressFilter::Range { lo: 0, hi: 50 })
+        );
+        assert_eq!(
+            parse_progress_filter("/50.."),
+            Some(ProgressFilter::Range { lo: 50, hi: 100 })
+        );
+        assert_eq!(
+            parse_progress_filter("/100"),
+            Some(ProgressFilter::Range { lo: 100, hi: 100 })
+        );
+        assert_eq!(
+            parse_progress_filter("/45..85"),
+            Some(ProgressFilter::Range { lo: 45, hi: 85 })
+        );
+        assert_eq!(
+            parse_progress_filter("/ 45 .. 85"),
+            Some(ProgressFilter::Range { lo: 45, hi: 85 })
+        );
+        assert_eq!(parse_progress_filter("/85..45"), Some(ProgressFilter::Rejected));
+        assert_eq!(parse_progress_filter("/150"), Some(ProgressFilter::Rejected));
+        assert_eq!(parse_progress_filter("/-3"), Some(ProgressFilter::Rejected));
+        assert_eq!(
+            parse_progress_filter("/; DROP TABLE tasks"),
+            Some(ProgressFilter::Rejected)
+        );
+        assert_eq!(parse_progress_filter("showall"), None);
+        assert_eq!(parse_progress_filter("add milk"), None);
+        assert_eq!(parse_progress_filter(""), None);
+    }
+
+    #[test]
+    fn list_progress_includes_completed_and_ignores_title() {
+        let path = tmp_db();
+        let store = Store::open(&path).unwrap();
+        let low = store
+            .add("0..10", "", Priority::Medium, Status::Pending, 0, "[]", None)
+            .unwrap();
+        let mid = store
+            .add("middle", "", Priority::Medium, Status::Pending, 0, "[]", None)
+            .unwrap();
+        let done = store
+            .add("shipped", "", Priority::Medium, Status::Pending, 0, "[]", None)
+            .unwrap();
+        store.set_progress(low.id, 5).unwrap();
+        store.set_progress(mid.id, 40).unwrap();
+        store.set_progress(done.id, 100).unwrap();
+        assert!(
+            !store
+                .list_active()
+                .unwrap()
+                .iter()
+                .any(|t| t.id == done.id),
+            "completed stays off the active list"
+        );
+        let all = store.list_all().unwrap();
+        assert!(all.iter().any(|t| t.id == done.id));
+        let low_hits = store.list_progress(0, 10).unwrap();
+        assert_eq!(low_hits.len(), 1);
+        assert_eq!(low_hits[0].id, low.id);
+        let open = store.list_progress(10, 100).unwrap();
+        let ids: Vec<_> = open.iter().map(|t| t.id).collect();
+        assert_eq!(ids, vec![mid.id, done.id]);
+        let exact = store.list_progress(100, 100).unwrap();
+        assert_eq!(exact.len(), 1);
+        assert_eq!(exact[0].title, "shipped");
+        assert!(store.list_progress(45, 85).unwrap().is_empty());
+        assert!(store.list_progress(101, 100).unwrap().is_empty());
+        drop(store);
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(format!("{}-wal", path.display()));
+        let _ = fs::remove_file(format!("{}-shm", path.display()));
     }
 
     #[test]

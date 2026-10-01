@@ -105,6 +105,7 @@ mod win {
     const SCROLLBAR_W: i32 = 12;
     const VK_MENU: u16 = 0x12;
     const VK_V: u16 = 0x56;
+    const VK_INSERT: u16 = 0x2D;
     const WM_SYSKEYDOWN: u32 = 0x0104;
 
     const PALETTE_W: i32 = 640;
@@ -192,6 +193,8 @@ mod win {
                                 ln.begin_todo_add();
                             } else if crate::search::todo_list_mode(&ln.query) && c == '%' {
                                 ln.begin_todo_progress();
+                            } else if crate::search::todo_list_mode(&ln.query) && c == '/' {
+                                ln.begin_todo_filter();
                             } else {
                                 ln.insert_at_caret(c);
                             }
@@ -203,6 +206,19 @@ mod win {
             }
             WM_KEYDOWN | WM_SYSKEYDOWN => {
                 let vk = w.0 as u16;
+                let paste_key = (vk == VK_V && ctrl_down() && !alt_down())
+                    || (vk == VK_INSERT && shift_down() && !ctrl_down() && !alt_down());
+                if paste_key {
+                    if let Some(text) = crate::capture::read_clipboard_text(4096) {
+                        if let Ok(mut g) = STATE.lock() {
+                            if let Some(ln) = g.as_mut() {
+                                let _ = ln.paste_keyword_arg(&text);
+                            }
+                        }
+                    }
+                    relayout(hwnd);
+                    return LRESULT(0);
+                }
                 if vk == 0x43 && ctrl_down() && !alt_down() {
                     let copied = STATE.lock().ok().and_then(|g| {
                         g.as_ref().and_then(|ln| {
@@ -525,6 +541,10 @@ mod win {
 
     fn ctrl_down() -> bool {
         unsafe { GetKeyState(0x11) as u16 & 0x8000 != 0 }
+    }
+
+    fn shift_down() -> bool {
+        unsafe { GetKeyState(0x10) as u16 & 0x8000 != 0 }
     }
 
     fn overlay_height(hits: usize, file_mode: bool, preview: bool, footer: bool) -> i32 {
