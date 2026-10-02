@@ -1408,8 +1408,7 @@ mod win {
                     let sw: Vec<u16> = sub.encode_utf16().collect();
                     let _ = TextOutW(hdc, 40, y + 22, &sw);
                 } else {
-                    let kind = format!("{:?}", h.kind).to_ascii_lowercase();
-                    let sub = format!("{kind}   {}", h.subtitle);
+                    let sub = crate::search::row_detail(h);
                     let sw: Vec<u16> = sub.encode_utf16().collect();
                     let _ = TextOutW(hdc, 40, y + 22, &sw);
                     if h.kind == katana_core::HitKind::Todo {

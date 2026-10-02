@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.3 — 2026-10-01
+
+### Home
+- Command rows no longer repeat the command name. The second line is only the description
+
 ## 0.3.2 — 2026-10-01
 
 ### Home

@@ -416,9 +416,9 @@ fn command_hits() -> Vec<Hit> {
     [
         ("/todo", Some('t'), "Tasks", HitKind::Todo),
         ("/clip", Some('c'), "Clipboard history", HitKind::Clip),
-        ("/shot", Some('s'), "Screenshot", HitKind::Shot),
+        ("/shot", Some('s'), "Region, window, or page", HitKind::Shot),
         ("/awake", None, "Keep screen awake", HitKind::Keyword),
-        ("/settings", None, "Settings", HitKind::Keyword),
+        ("/settings", None, "Shortcuts, todos, hotkeys", HitKind::Keyword),
     ]
     .into_iter()
     .map(|(cmd, letter, subtitle, kind)| {
@@ -449,6 +449,25 @@ fn command_hits() -> Vec<Hit> {
         }
     })
     .collect()
+}
+
+/// Second line under a palette row. Home commands already show their name,
+/// so the kind (`todo`, `keyword`, …) is not repeated in front of the description.
+pub fn row_detail(h: &Hit) -> String {
+    let sub = h.subtitle.trim();
+    if h.id.starts_with("cmd:") {
+        return sub.to_string();
+    }
+    let kind = format!("{:?}", h.kind).to_ascii_lowercase();
+    if sub.is_empty() {
+        return kind;
+    }
+    let title = h.title.to_ascii_lowercase();
+    let sub_l = sub.to_ascii_lowercase();
+    if title.contains(&kind) || sub_l.starts_with(&kind) {
+        return sub.to_string();
+    }
+    format!("{kind}   {sub}")
 }
 
 pub fn is_home_query(q: &str) -> bool {
@@ -957,6 +976,18 @@ mod tests {
         let (r, hits) = e.search("", None, None, 16);
         assert!(matches!(r, Route::Recents));
         assert!(hits.iter().any(|h| h.title == "/[t]odo"), "{:?}", hits.iter().map(|h| &h.title).collect::<Vec<_>>());
+        let todo = hits.iter().find(|h| h.id == "cmd:/todo").unwrap();
+        assert_eq!(row_detail(todo), "Tasks");
+        let clip = hits.iter().find(|h| h.id == "cmd:/clip").unwrap();
+        assert_eq!(row_detail(clip), "Clipboard history");
+        let shot = hits.iter().find(|h| h.id == "cmd:/shot").unwrap();
+        assert_eq!(row_detail(shot), "Region, window, or page");
+        let awake = hits.iter().find(|h| h.id == "cmd:/awake").unwrap();
+        assert!(!row_detail(awake).to_ascii_lowercase().contains("keyword"));
+        let settings = hits.iter().find(|h| h.id == "cmd:/settings").unwrap();
+        assert_eq!(row_detail(settings), "Shortcuts, todos, hotkeys");
+        let kw = Hit::new("kw:g", "g", "rust crates", 1.0, HitKind::Keyword);
+        assert_eq!(row_detail(&kw), "keyword   rust crates");
         assert!(hits.iter().any(|h| h.title == "/[s]hot"));
         assert!(
             !hits.iter().any(|h| h.id == "cmd:/k" || h.id == "cmd:/f"),
