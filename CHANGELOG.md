@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.4 — 2026-10-05
+
+### UI
+- The selected row is now deep indigo, so it stands out against the amber accent
+
 ## 0.3.3 — 2026-10-01
 
 ### Home
