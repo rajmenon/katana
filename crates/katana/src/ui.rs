@@ -116,12 +116,12 @@ mod win {
     const MAX_ROWS: i32 = 8;
     const RADIUS: i32 = 14;
 
-    // BGR COLORREF — zinc / amber
+    // BGR COLORREF — zinc / amber chrome; indigo selection contrasts amber
     const BG: u32 = 0x0014_1416;
-    const ROW_SEL: u32 = 0x0022_1C14;
+    const ROW_SEL: u32 = 0x00A3_3037; // RGB #3730A3 indigo-800
     const TEXT: u32 = 0x00F4_F4F5;
     const MUTED: u32 = 0x00A1_A1AA;
-    const ACCENT: u32 = 0x0024_A5F5;
+    const ACCENT: u32 = 0x0024_A5F5; // RGB #F5A524 amber
     const BORDER: u32 = 0x002E_2A24;
     const FAIL: u32 = 0x0028_28F0; // BGR red flash
     const TIMER_FAIL: usize = 1;
