@@ -118,6 +118,11 @@ impl Launcher {
     fn search_limit(&self, raw: &str) -> usize {
         if crate::search::is_file_blade(raw) {
             crate::search::FILE_SEARCH_LIMIT
+        } else if crate::search::is_clip_blade(raw) {
+            // Include every stored clip so wheel/scrollbar can reach the oldest.
+            self.clip_history_limit.max(24)
+        } else if crate::search::todo_list_mode(raw) {
+            512
         } else {
             24
         }
@@ -173,23 +178,24 @@ impl Launcher {
     }
 
     pub fn ensure_file_scroll(&mut self) {
-        if !crate::search::is_file_blade(&self.query) {
+        if !crate::search::list_scroll_mode(&self.query) {
             self.file_scroll = 0;
             return;
         }
+        let vis = crate::search::list_page(&self.query);
         self.file_scroll = crate::search::file_scroll_keep_visible(
             self.hits.len(),
-            crate::search::FILE_PAGE,
+            vis,
             self.selected,
             self.file_scroll,
         );
     }
 
     pub fn scroll_files_by(&mut self, delta: i32) {
-        if !crate::search::is_file_blade(&self.query) {
+        if !crate::search::list_scroll_mode(&self.query) {
             return;
         }
-        let vis = crate::search::FILE_PAGE;
+        let vis = crate::search::list_page(&self.query);
         let max_scroll = self.hits.len().saturating_sub(vis);
         if delta < 0 {
             self.file_scroll = self.file_scroll.saturating_sub((-delta) as usize);
@@ -206,7 +212,10 @@ impl Launcher {
     }
 
     pub fn page_files(&mut self, down: bool) {
-        let vis = crate::search::FILE_PAGE;
+        if !crate::search::list_scroll_mode(&self.query) {
+            return;
+        }
+        let vis = crate::search::list_page(&self.query);
         if down {
             self.selected = (self.selected + vis).min(self.hits.len().saturating_sub(1));
         } else {
@@ -1469,6 +1478,44 @@ mod tests {
         assert_eq!(l.file_scroll, 12 + 1 - crate::search::FILE_PAGE);
         l.scroll_files_by(-2);
         assert!(l.file_scroll < 5);
+    }
+
+    #[test]
+    fn clip_and_todo_lists_scroll_like_files() {
+        let mut l = launch();
+        l.clip_history_limit = 40;
+        for i in 0..30 {
+            assert!(l.ingest_clipboard_text(&format!("clip-item-{i}")).unwrap().is_some());
+        }
+        l.set_query("/clip");
+        assert!(l.hits.len() > crate::search::FILE_PAGE, "hits={}", l.hits.len());
+        l.selected = 12;
+        l.ensure_file_scroll();
+        assert_eq!(l.file_scroll, 12 + 1 - crate::search::FILE_PAGE);
+        l.scroll_files_by(3);
+        assert!(l.file_scroll >= 3);
+
+        for i in 0..20 {
+            l.todos
+                .add(
+                    &format!("task-{i}"),
+                    "",
+                    katana_todo::Priority::Medium,
+                    katana_todo::Status::Pending,
+                    0,
+                    "[]",
+                    None,
+                )
+                .unwrap();
+        }
+        l.set_query("/todo");
+        assert!(l.hits.len() > crate::search::FILE_PAGE, "todo hits={}", l.hits.len());
+        l.selected = 15;
+        l.ensure_file_scroll();
+        assert_eq!(l.file_scroll, 15 + 1 - crate::search::FILE_PAGE);
+        l.page_files(true);
+        assert!(l.selected > 15);
+        assert!(l.file_scroll > 0);
     }
 
     #[test]

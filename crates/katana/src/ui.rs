@@ -337,7 +337,7 @@ mod win {
                     VK_PRIOR => {
                         if let Ok(mut g) = STATE.lock() {
                             if let Some(ln) = g.as_mut() {
-                                if crate::search::is_file_blade(&ln.query) && !ln.composing() {
+                                if crate::search::list_scroll_mode(&ln.query) && !ln.composing() {
                                     ln.page_files(false);
                                 }
                             }
@@ -347,7 +347,7 @@ mod win {
                     VK_NEXT => {
                         if let Ok(mut g) = STATE.lock() {
                             if let Some(ln) = g.as_mut() {
-                                if crate::search::is_file_blade(&ln.query) && !ln.composing() {
+                                if crate::search::list_scroll_mode(&ln.query) && !ln.composing() {
                                     ln.page_files(true);
                                 }
                             }
@@ -410,11 +410,26 @@ mod win {
                 let y = (((l.0 as u32) >> 16) & 0xFFFF) as i16 as i32;
                 let header_top = H_BAR + 4;
                 let in_header = y >= header_top && y < header_top + 20;
-                let file_mode = STATE
+                let (file_mode, scroll_mode) = STATE
                     .lock()
                     .ok()
-                    .and_then(|g| g.as_ref().map(|ln| crate::search::is_file_blade(&ln.query)))
-                    .unwrap_or(false);
+                    .and_then(|g| {
+                        g.as_ref().map(|ln| {
+                            (
+                                crate::search::is_file_blade(&ln.query),
+                                crate::search::list_scroll_mode(&ln.query),
+                            )
+                        })
+                    })
+                    .unwrap_or((false, false));
+                let row_h = if file_mode { FILE_ROW_H } else { ROW_H };
+                let list_top = if file_mode {
+                    header_top + 20
+                } else {
+                    header_top
+                };
+                let width = if file_mode { FILE_W } else { PALETTE_W };
+                let page = crate::search::FILE_PAGE;
                 if y < H_BAR {
                     set_caret_from_click(hwnd, x);
                     relayout(hwnd);
@@ -426,16 +441,16 @@ mod win {
                         }
                     }
                     relayout(hwnd);
-                } else if file_mode && x >= FILE_W - SCROLLBAR_W - 4 {
-                    let list_top = header_top + 20;
-                    let track_h = (crate::search::FILE_PAGE as i32) * FILE_ROW_H;
+                } else if scroll_mode && x >= width - SCROLLBAR_W - 4 {
+                    let track_h = (page as i32) * row_h;
                     let click_y = y - list_top;
                     if click_y >= 0 && click_y <= track_h {
                         if let Ok(mut g) = STATE.lock() {
                             if let Some(ln) = g.as_mut() {
+                                let vis = crate::search::list_page(&ln.query);
                                 ln.file_scroll = crate::search::scroll_from_track_click(
                                     ln.hits.len(),
-                                    crate::search::FILE_PAGE,
+                                    vis,
                                     track_h,
                                     click_y,
                                 );
@@ -444,9 +459,8 @@ mod win {
                         }
                         relayout(hwnd);
                     }
-                } else if file_mode && y >= header_top + 20 {
-                    let list_top = header_top + 20;
-                    let row = ((y - list_top) / FILE_ROW_H) as usize;
+                } else if scroll_mode && y >= list_top {
+                    let row = ((y - list_top) / row_h) as usize;
                     if let Ok(mut g) = STATE.lock() {
                         if let Some(ln) = g.as_mut() {
                             let abs = ln.file_scroll + row;
@@ -465,7 +479,7 @@ mod win {
                 if steps != 0 {
                     if let Ok(mut g) = STATE.lock() {
                         if let Some(ln) = g.as_mut() {
-                            if crate::search::is_file_blade(&ln.query) {
+                            if crate::search::list_scroll_mode(&ln.query) {
                                 ln.scroll_files_by(steps);
                             }
                         }
@@ -1288,6 +1302,7 @@ mod win {
         let _ = DeleteObject(accent);
 
         let file_mode = crate::search::is_file_blade(&q);
+        let scroll_mode = crate::search::list_scroll_mode(&q);
         let row_h = if file_mode { FILE_ROW_H } else { ROW_H };
         let mut y0 = H_BAR + 4;
         if file_mode {
@@ -1317,7 +1332,7 @@ mod win {
             y0 += 20;
         }
         let list_top = y0;
-        let start = if file_mode {
+        let start = if scroll_mode {
             file_scroll.min(rows.len())
         } else {
             0
@@ -1420,11 +1435,12 @@ mod win {
             }
         }
 
-        if file_mode {
-            let track_h = (crate::search::FILE_PAGE as i32) * FILE_ROW_H;
+        if scroll_mode {
+            let page = crate::search::list_page(&q);
+            let track_h = (page as i32) * row_h;
             if let Some((ty, th)) = crate::search::scrollbar_thumb(
                 rows.len(),
-                crate::search::FILE_PAGE,
+                page,
                 file_scroll,
                 track_h,
             ) {
