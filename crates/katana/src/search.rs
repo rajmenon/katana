@@ -486,6 +486,16 @@ pub fn is_file_blade(q: &str) -> bool {
     matches!(katana_core::slash_verb(q), Some("f" | "file" | "files"))
 }
 
+/// File browser, clipboard history, and todo list share wheel + scrollbar.
+pub fn list_scroll_mode(q: &str) -> bool {
+    is_file_blade(q) || is_clip_blade(q) || todo_list_mode(q)
+}
+
+/// Visible page size for scrollable lists (matches overlay MAX_ROWS / FILE_PAGE).
+pub fn list_page(_q: &str) -> usize {
+    FILE_PAGE
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileSort {
     Score,
@@ -1099,6 +1109,10 @@ mod tests {
         assert!(is_todo_blade("/t showall") && todo_list_mode("/todo showall"));
         assert!(todo_list_mode("/todo /0..10") && todo_list_mode("/todo /"));
         assert!(!todo_list_mode("/todo add milk"));
+        assert!(list_scroll_mode("/f ") && list_scroll_mode("/clip") && list_scroll_mode("/todo"));
+        assert!(list_scroll_mode("/todo showall") && !list_scroll_mode("/todo add milk"));
+        assert!(!list_scroll_mode("") && !list_scroll_mode("/shot"));
+        assert_eq!(list_page("/clip"), FILE_PAGE);
         assert!(blade_footer("/todo", false).unwrap().contains("/ 0..100"));
     }
 
