@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.5 — 2026-10-08
+
+### UI
+- Clipboard history and the to-do list now scroll like file search (wheel, scrollbar, PgUp/PgDn)
+
 ## 0.3.4 — 2026-10-05
 
 ### UI

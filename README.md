@@ -25,7 +25,7 @@ Special commands start with **`/`**. Short forms: `/t` todo, `/c` clipboard, `/s
 
 ## Download
 
-**[Katana 0.3.4 for Windows](https://github.com/rajmenon/katana/releases/latest)** — `Katana-0.3.4-windows-x86_64.exe` (~2.7 MB). Run it; it stays in the tray. **Alt+Space** opens the prompt.
+**[Katana 0.3.5 for Windows](https://github.com/rajmenon/katana/releases/latest)** — `Katana-0.3.5-windows-x86_64.exe` (~2.7 MB). Run it; it stays in the tray. **Alt+Space** opens the prompt.
 
 ## Run
 
