@@ -41,6 +41,9 @@ pub struct Settings {
     /// Max clipboard history items. Oldest unpinned clips are dropped.
     #[serde(default = "default_clip_history_limit")]
     pub clip_history_limit: usize,
+    /// Last keyword name run from the prompt. Empty Tab restores it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub last_keyword: String,
 }
 
 pub const CLIP_HISTORY_CHOICES: &[usize] = &[25, 50, 100, 200, 500];
@@ -135,6 +138,7 @@ impl Default for Settings {
             save_shots: true,
             crawl_folders: Vec::new(),
             clip_history_limit: default_clip_history_limit(),
+            last_keyword: String::new(),
         }
     }
 }
@@ -400,6 +404,7 @@ mod tests {
             save_shots: true,
             crawl_folders: vec![r"C:\src".into()],
             clip_history_limit: 50,
+            last_keyword: "g".into(),
         };
         s.save(&path).unwrap();
         let loaded = Settings::load(&path);
@@ -416,6 +421,7 @@ mod tests {
         assert_eq!(Settings::load(&p).files_hotkey, "win+alt+space");
         assert!(Settings::default().save_shots);
         assert_eq!(Settings::load(&p).clip_history_limit, 100);
+        assert!(Settings::load(&p).last_keyword.is_empty());
     }
 
     #[test]

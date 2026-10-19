@@ -106,6 +106,7 @@ mod win {
     const VK_MENU: u16 = 0x12;
     const VK_V: u16 = 0x56;
     const VK_INSERT: u16 = 0x2D;
+    const VK_TAB: u16 = 0x09;
     const WM_SYSKEYDOWN: u32 = 0x0104;
 
     const PALETTE_W: i32 = 640;
@@ -250,6 +251,15 @@ mod win {
                 }
                 if msg == WM_SYSKEYDOWN {
                     return DefWindowProcW(hwnd, msg, w, l);
+                }
+                if vk == VK_TAB && !ctrl_down() {
+                    if let Ok(mut g) = STATE.lock() {
+                        if let Some(ln) = g.as_mut() {
+                            let _ = ln.tab_complete(shift_down());
+                        }
+                    }
+                    relayout(hwnd);
+                    return LRESULT(0);
                 }
                 match vk {
                     VK_ESCAPE => {

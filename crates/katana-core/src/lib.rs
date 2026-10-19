@@ -8,8 +8,9 @@ mod tokens;
 
 pub use calc::{eval_calc, CalcError};
 pub use keyword::{
-    classify_command, default_keywords, find_keyword, is_safe_http_url, paste_url_arg,
-    resolve_keyword, Keyword, ResolvedAction,
+    classify_command, complete_keyword, default_keywords, find_keyword, is_safe_http_url,
+    keyword_complete_stem, keyword_completions, paste_url_arg, resolve_keyword, Keyword,
+    KeywordComplete, ResolvedAction,
 };
 pub use query::{route, parse_shot_rest, Query, Route, ShotMode};
 pub use rank::{fuzzy_score, merge_hits, score_hit, FuzzyEngine, Hit, HitKind, PreparedQuery};

@@ -2,7 +2,8 @@
 
 use katana_clip::ClipStore;
 use katana_core::{
-    find_keyword, parse_shot_rest, resolve_keyword, Hit, ResolvedAction, Route, ShotMode,
+    find_keyword, keyword_complete_stem, keyword_completions, parse_shot_rest, resolve_keyword,
+    Hit, ResolvedAction, Route, ShotMode,
 };
 use katana_index::NameIndex;
 use katana_shot::{dib_from_bgra, png_from_bgra, PhysRect};
@@ -50,6 +51,11 @@ pub struct Launcher {
     pub file_scroll: usize,
     /// Char index in the editable prompt (query, or todo compose buffer).
     pub caret: usize,
+    /// Last keyword name executed from the prompt.
+    pub last_keyword: Option<String>,
+    tab_active: bool,
+    tab_stem: String,
+    tab_index: usize,
     clip_preview: Option<(i64, u32, u32, Vec<u8>)>,
 }
 
@@ -78,6 +84,10 @@ impl Launcher {
             file_sort_desc: false,
             file_scroll: 0,
             caret: 0,
+            last_keyword: None,
+            tab_active: false,
+            tab_stem: String::new(),
+            tab_index: 0,
             clip_preview: None,
         })
     }
@@ -95,6 +105,14 @@ impl Launcher {
         let settings = crate::persist::Settings::load(&crate::persist::settings_path());
         let clip_history_limit =
             crate::persist::clamp_clip_history_limit(settings.clip_history_limit);
+        let last_keyword = {
+            let s = settings.last_keyword.trim();
+            if !s.is_empty() && find_keyword(&engine.keywords, s).is_some() {
+                Some(s.to_string())
+            } else {
+                None
+            }
+        };
         let _ = clips.trim_to(clip_history_limit);
         Ok(Self {
             engine,
@@ -111,6 +129,10 @@ impl Launcher {
             file_sort_desc: false,
             file_scroll: 0,
             caret: 0,
+            last_keyword,
+            tab_active: false,
+            tab_stem: String::new(),
+            tab_index: 0,
             clip_preview: None,
         })
     }
@@ -134,6 +156,7 @@ impl Launcher {
 
     pub fn set_query_keep_caret(&mut self, raw: &str, caret: usize) -> Vec<Hit> {
         self.todo_input = None;
+        self.tab_active = false;
         self.query = raw.to_string();
         self.caret = crate::search::clamp_caret(self.query.chars().count(), caret);
         let limit = self.search_limit(raw);
@@ -315,6 +338,63 @@ impl Launcher {
         self.caret = self.edit_buf().chars().count();
     }
 
+    /// Tab-complete the first token to a keyword. Empty prompt restores the last keyword.
+    /// Shift+Tab (`reverse`) walks the match list backward.
+    pub fn tab_complete(&mut self, reverse: bool) -> bool {
+        if self.composing() {
+            return false;
+        }
+        let Some(typed_stem) = keyword_complete_stem(&self.query) else {
+            self.tab_active = false;
+            return false;
+        };
+        let stem = if self.tab_active {
+            self.tab_stem.clone()
+        } else {
+            typed_stem
+        };
+        let names = keyword_completions(&stem, &self.engine.keywords, self.last_keyword.as_deref());
+        if names.is_empty() {
+            return false;
+        }
+        let n = names.len();
+        let idx = if self.tab_active {
+            if reverse {
+                (self.tab_index + n - 1) % n
+            } else {
+                (self.tab_index + 1) % n
+            }
+        } else if reverse {
+            n - 1
+        } else {
+            0
+        };
+        let name = names[idx].clone();
+        self.set_query(&format!("{name} "));
+        self.tab_active = true;
+        self.tab_stem = stem;
+        self.tab_index = idx;
+        true
+    }
+
+    fn remember_keyword(&mut self, name: &str) {
+        let name = name.trim();
+        if name.is_empty() || find_keyword(&self.engine.keywords, name).is_none() {
+            return;
+        }
+        self.last_keyword = Some(name.to_string());
+        if self.dry_run {
+            return;
+        }
+        let path = crate::persist::settings_path();
+        let mut s = crate::persist::Settings::load(&path);
+        if s.last_keyword == name {
+            return;
+        }
+        s.last_keyword = name.to_string();
+        let _ = s.save(&path);
+    }
+
     /// Char index in `prompt_text()` where the caret is drawn.
     pub fn prompt_caret_index(&self) -> usize {
         let prefix = match &self.todo_input {
@@ -358,6 +438,7 @@ impl Launcher {
             }
             Route::Url { url } => self.run_action(&ResolvedAction::OpenUrl(url)),
             Route::Keyword { name, arg } => {
+                self.remember_keyword(&name);
                 let kw = find_keyword(&self.engine.keywords, &name)
                     .ok_or_else(|| format!("unknown keyword {name}"))?;
                 let clip = self
@@ -1596,5 +1677,34 @@ mod tests {
         assert_eq!(px.len(), (tw * th * 4) as usize);
         let again = l.clip_preview(bid).unwrap();
         assert_eq!((again.0, again.1), (tw, th));
+    }
+
+    #[test]
+    fn tab_completes_keywords_and_restores_last() {
+        let mut l = launch();
+        l.set_query("you");
+        assert!(l.tab_complete(false));
+        assert_eq!(l.query, "youtube ");
+        l.execute_current().unwrap();
+        assert_eq!(l.last_keyword.as_deref(), Some("youtube"));
+
+        l.set_query("");
+        assert!(l.tab_complete(false));
+        assert_eq!(l.query, "youtube ");
+
+        l.set_query("g");
+        assert!(l.tab_complete(false));
+        assert_eq!(l.query, "g ");
+        assert!(l.tab_complete(false));
+        assert_eq!(l.query, "gh ");
+        assert!(l.tab_complete(true));
+        assert_eq!(l.query, "g ");
+
+        l.set_query("/f invoice");
+        assert!(!l.tab_complete(false));
+        assert_eq!(l.query, "/f invoice");
+        l.set_query("g rust");
+        assert!(!l.tab_complete(false));
+        assert_eq!(l.query, "g rust");
     }
 }

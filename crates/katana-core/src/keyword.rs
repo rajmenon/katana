@@ -354,6 +354,99 @@ pub fn paste_url_arg(query: &str, kws: &[Keyword], raw: &str) -> Option<String> 
     Some(format!("{prefix}{arg}"))
 }
 
+/// First token of a query that Tab can complete as a keyword.
+/// `None` for slash blades, shell, calculator, or a keyword that already has arguments.
+pub fn keyword_complete_stem(query: &str) -> Option<String> {
+    let t = query.trim();
+    if t.is_empty() {
+        return Some(String::new());
+    }
+    if t.starts_with(['/', '>', '=', '#']) {
+        return None;
+    }
+    let (verb, rest) = crate::split_verb(t);
+    let verb = verb?;
+    if !rest.is_empty() {
+        return None;
+    }
+    Some(verb.to_string())
+}
+
+/// Keyword names that Tab should offer for `stem`, last-used first when it matches.
+pub fn keyword_completions(stem: &str, kws: &[Keyword], last: Option<&str>) -> Vec<String> {
+    let p = stem.to_ascii_lowercase();
+    let last_l = last.map(|s| s.to_ascii_lowercase());
+    if p.is_empty() {
+        let mut v = Vec::new();
+        if let Some(l) = last {
+            if find_keyword(kws, l).is_some() {
+                v.push(l.to_string());
+            }
+        }
+        for k in kws {
+            let Some(n) = k.names.first() else {
+                continue;
+            };
+            if v.iter().any(|x| x.eq_ignore_ascii_case(n)) {
+                continue;
+            }
+            v.push(n.clone());
+        }
+        return v;
+    }
+    let mut v: Vec<String> = kws
+        .iter()
+        .flat_map(|k| k.names.iter())
+        .filter(|n| n.to_ascii_lowercase().starts_with(&p))
+        .cloned()
+        .collect();
+    v.sort_by(|a, b| a.to_ascii_lowercase().cmp(&b.to_ascii_lowercase()));
+    v.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+    v.sort_by(|a, b| {
+        let al = a.to_ascii_lowercase();
+        let bl = b.to_ascii_lowercase();
+        let rank = |n: &str, nl: &str| {
+            let last_hit = last_l.as_deref() == Some(nl);
+            let exact = nl == p;
+            (
+                if last_hit { 0u8 } else { 1 },
+                if exact { 0u8 } else { 1 },
+                n.len(),
+                nl.to_string(),
+            )
+        };
+        rank(a, &al).cmp(&rank(b, &bl))
+    });
+    v
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeywordComplete {
+    pub name: String,
+    pub index: usize,
+    pub count: usize,
+}
+
+/// Name at `index` in the Tab cycle for `stem`.
+pub fn complete_keyword(
+    stem: &str,
+    kws: &[Keyword],
+    last: Option<&str>,
+    index: usize,
+) -> Option<KeywordComplete> {
+    let names = keyword_completions(stem, kws, last);
+    if names.is_empty() {
+        return None;
+    }
+    let count = names.len();
+    let index = index % count;
+    Some(KeywordComplete {
+        name: names[index].clone(),
+        index,
+        count,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -511,5 +604,35 @@ mod tests {
             ResolvedAction::Shell { admin, .. } => assert!(admin),
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn tab_stem_skips_blades_and_args() {
+        assert_eq!(keyword_complete_stem(""), Some(String::new()));
+        assert_eq!(keyword_complete_stem("  you  "), Some("you".into()));
+        assert_eq!(keyword_complete_stem("g "), Some("g".into()));
+        assert_eq!(keyword_complete_stem("g rust"), None);
+        assert_eq!(keyword_complete_stem("/f"), None);
+        assert_eq!(keyword_complete_stem("> dir"), None);
+        assert_eq!(keyword_complete_stem("=1+1"), None);
+    }
+
+    #[test]
+    fn tab_completes_prefix_and_prefers_last() {
+        let kws = default_keywords();
+        let you = complete_keyword("you", &kws, None, 0).unwrap();
+        assert_eq!(you.name, "youtube");
+        assert_eq!(you.count, 1);
+        let first = complete_keyword("g", &kws, Some("gh"), 0).unwrap();
+        assert_eq!(first.name, "gh");
+        let names = keyword_completions("g", &kws, Some("gh"));
+        assert!(names.contains(&"g".into()));
+        assert!(names.contains(&"google".into()));
+        assert!(names.contains(&"github".into()));
+        let empty = keyword_completions("", &kws, Some("docs"));
+        assert_eq!(empty[0], "docs");
+        assert!(empty.contains(&"g".into()));
+        assert!(!empty.iter().any(|n| n == "google"));
+        assert!(complete_keyword("zzzz", &kws, None, 0).is_none());
     }
 }
