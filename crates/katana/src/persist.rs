@@ -3,7 +3,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use katana_core::{default_keywords, Keyword};
+use katana_core::{default_keywords, HitKind, Keyword, RecentItem, Recents, RECENTS_CAP};
 use serde::{Deserialize, Serialize};
 
 pub fn data_dir() -> PathBuf {
@@ -19,6 +19,120 @@ pub fn keywords_path() -> PathBuf {
 
 pub fn settings_path() -> PathBuf {
     data_dir().join("config.toml")
+}
+
+pub fn recents_path() -> PathBuf {
+    data_dir().join("recents.json")
+}
+
+/// One remembered item on disk. Clip rows keep only the clip id: the text
+/// stays in `clipboard.db`, so clearing clipboard history also clears it here.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RecentSer {
+    id: String,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    subtitle: String,
+    kind: String,
+    #[serde(default)]
+    is_dir: bool,
+    #[serde(default)]
+    type_name: Option<String>,
+    #[serde(default)]
+    used_at: u64,
+    #[serde(default = "one")]
+    uses: u32,
+}
+
+fn one() -> u32 {
+    1
+}
+
+#[derive(Serialize, Deserialize, Default)]
+struct RecentFile {
+    #[serde(default)]
+    recent: Vec<RecentSer>,
+}
+
+fn kind_name(k: HitKind) -> &'static str {
+    match k {
+        HitKind::Keyword => "keyword",
+        HitKind::App => "app",
+        HitKind::Todo => "todo",
+        HitKind::Clip => "clip",
+        HitKind::File => "file",
+        HitKind::Calc => "calc",
+        HitKind::Shell => "shell",
+        HitKind::Shot => "shot",
+    }
+}
+
+fn kind_from_name(s: &str) -> Option<HitKind> {
+    Some(match s {
+        "keyword" => HitKind::Keyword,
+        "app" => HitKind::App,
+        "clip" => HitKind::Clip,
+        "file" => HitKind::File,
+        "shell" => HitKind::Shell,
+        _ => return None,
+    })
+}
+
+/// Missing or broken file = empty history (never an error on startup).
+pub fn load_recents(path: &Path) -> Recents {
+    let Ok(raw) = fs::read_to_string(path) else {
+        return Recents::default();
+    };
+    let Ok(file) = serde_json::from_str::<RecentFile>(&raw) else {
+        return Recents::default();
+    };
+    let items = file
+        .recent
+        .into_iter()
+        .filter_map(|r| {
+            Some(RecentItem {
+                kind: kind_from_name(&r.kind)?,
+                id: r.id,
+                title: r.title,
+                subtitle: r.subtitle,
+                is_dir: r.is_dir,
+                type_name: r.type_name,
+                used_at: r.used_at,
+                uses: r.uses.max(1),
+            })
+        })
+        .collect();
+    Recents::from_items(items, RECENTS_CAP)
+}
+
+pub fn save_recents(path: &Path, recents: &Recents) -> Result<(), String> {
+    if let Some(p) = path.parent() {
+        fs::create_dir_all(p).map_err(|e| e.to_string())?;
+    }
+    let file = RecentFile {
+        recent: recents
+            .items()
+            .iter()
+            .map(|x| {
+                let clip = x.kind == HitKind::Clip;
+                RecentSer {
+                    id: x.id.clone(),
+                    title: if clip { String::new() } else { x.title.clone() },
+                    subtitle: if clip { String::new() } else { x.subtitle.clone() },
+                    kind: kind_name(x.kind).into(),
+                    is_dir: x.is_dir,
+                    type_name: x.type_name.clone(),
+                    used_at: x.used_at,
+                    uses: x.uses,
+                }
+            })
+            .collect(),
+    };
+    let raw = serde_json::to_string_pretty(&file).map_err(|e| e.to_string())?;
+    let tmp = path.with_extension("json.tmp");
+    fs::write(&tmp, raw).map_err(|e| e.to_string())?;
+    fs::rename(&tmp, path).map_err(|e| e.to_string())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -384,6 +498,29 @@ mod tests {
         assert_eq!(j.url.as_deref(), Some("https://jira.example/browse/$P$"));
         let g = loaded.iter().find(|k| k.matches("g")).unwrap();
         assert!(g.url.as_deref().unwrap().contains("google"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn recents_roundtrip_keeps_order_and_drops_clip_text() {
+        use katana_core::Hit;
+        let dir = tmp("recents");
+        let path = dir.join("recents.json");
+        let mut r = Recents::default();
+        r.touch(&Hit::new("app:C:\\Code.exe", "Visual Studio Code", "Application", 1.0, HitKind::App), 10);
+        r.touch(&Hit::new("clip:7", "my secret paste", "text", 1.0, HitKind::Clip), 11);
+        r.touch(&Hit::new("run:g rust", "g rust", "keyword", 1.0, HitKind::Keyword), 12);
+        save_recents(&path, &r).unwrap();
+        let raw = fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("my secret paste"), "clip text stays in clipboard.db");
+        let back = load_recents(&path);
+        let ids: Vec<_> = back.items().iter().map(|x| x.id.as_str()).collect();
+        assert_eq!(ids, ["run:g rust", "clip:7", "app:C:\\Code.exe"]);
+        assert_eq!(back.items()[2].title, "Visual Studio Code");
+        assert_eq!(back.items()[1].kind, HitKind::Clip);
+        fs::write(&path, "not json").unwrap();
+        assert!(load_recents(&path).is_empty());
+        assert!(load_recents(&dir.join("missing.json")).is_empty());
         let _ = fs::remove_dir_all(dir);
     }
 

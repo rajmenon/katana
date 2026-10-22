@@ -2,7 +2,8 @@
 
 use katana_clip::ClipStore;
 use katana_core::{
-    find_keyword, parse_shot_rest, resolve_keyword, Hit, ResolvedAction, Route, ShotMode,
+    find_keyword, is_recent_hit, parse_shot_rest, resolve_keyword, Hit, HitKind, ResolvedAction,
+    Route, ShotMode,
 };
 use katana_index::NameIndex;
 use katana_shot::{dib_from_bgra, png_from_bgra, PhysRect};
@@ -51,6 +52,10 @@ pub struct Launcher {
     /// Char index in the editable prompt (query, or todo compose buffer).
     pub caret: usize,
     clip_preview: Option<(i64, u32, u32, Vec<u8>)>,
+    /// `recents.json`; `None` keeps history in memory only (tests).
+    pub recents_path: Option<std::path::PathBuf>,
+    /// Nested `execute_current` calls (keyword → query) record only once.
+    exec_depth: u32,
 }
 
 impl Launcher {
@@ -79,6 +84,8 @@ impl Launcher {
             file_scroll: 0,
             caret: 0,
             clip_preview: None,
+            recents_path: None,
+            exec_depth: 0,
         })
     }
 
@@ -96,6 +103,9 @@ impl Launcher {
         let clip_history_limit =
             crate::persist::clamp_clip_history_limit(settings.clip_history_limit);
         let _ = clips.trim_to(clip_history_limit);
+        let recents_path = crate::persist::recents_path();
+        engine.recents = crate::persist::load_recents(&recents_path);
+        refresh_clip_recents(&mut engine.recents, &clips);
         Ok(Self {
             engine,
             todos,
@@ -112,6 +122,8 @@ impl Launcher {
             file_scroll: 0,
             caret: 0,
             clip_preview: None,
+            recents_path: Some(recents_path),
+            exec_depth: 0,
         })
     }
 
@@ -342,7 +354,149 @@ impl Launcher {
         self.execute_current()
     }
 
+    /// Run what Enter means right now, and remember it when it launched something.
     pub fn execute_current(&mut self) -> Result<Outcome, String> {
+        let candidate = if self.exec_depth == 0 {
+            self.recent_candidate()
+        } else {
+            None
+        };
+        self.exec_depth += 1;
+        let out = self.execute_current_inner();
+        self.exec_depth -= 1;
+        if let (Some(h), Ok(Outcome::Ran(_) | Outcome::Paste | Outcome::Copied(_))) =
+            (candidate, &out)
+        {
+            self.remember(&h);
+        }
+        out
+    }
+
+    /// What Enter would add to recents: typed keywords, URLs, and `>` lines are
+    /// kept as the text you typed; apps, files, folders, bookmarks, and clips by id.
+    fn recent_candidate(&self) -> Option<Hit> {
+        if self.composing() {
+            return None;
+        }
+        let typed = self.query.trim();
+        let run = |kind: HitKind, sub: &str| {
+            Some(Hit::new(format!("run:{typed}"), typed.to_string(), sub.to_string(), 1.0, kind))
+        };
+        match self.engine.route_str(&self.query) {
+            Route::Keyword { .. } if self.selected > 0 => self.selected_candidate(),
+            Route::Keyword { name, .. } => {
+                find_keyword(&self.engine.keywords, &name)?;
+                run(HitKind::Keyword, "")
+            }
+            Route::Url { .. } => run(HitKind::Keyword, "Open URL"),
+            Route::Shell { .. } => run(HitKind::Shell, "Run command"),
+            Route::Shortcuts { .. }
+            | Route::Launch { .. }
+            | Route::Clip { .. }
+            | Route::Files { .. }
+            | Route::Apps { .. }
+            | Route::Unified { .. }
+            | Route::Recents => self.selected_candidate(),
+            _ => None,
+        }
+    }
+
+    fn selected_candidate(&self) -> Option<Hit> {
+        let h = self.hits.get(self.selected)?;
+        if h.id.starts_with("cmd:") || h.id == "studio" || h.id == "clip:clear" {
+            return None;
+        }
+        match h.kind {
+            HitKind::Todo | HitKind::Calc | HitKind::Shot => None,
+            HitKind::Keyword if !h.id.starts_with("bm:") && !h.id.starts_with("run:") => {
+                let mut r = h.clone();
+                r.id = format!("run:{}", h.title.trim());
+                Some(r)
+            }
+            _ => Some(h.clone()),
+        }
+    }
+
+    /// Move `h` to the front of recents and write `recents.json`.
+    pub fn remember(&mut self, h: &Hit) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        self.engine.recents.touch(h, now);
+        self.save_recents();
+    }
+
+    fn save_recents(&self) {
+        if let Some(p) = &self.recents_path {
+            let _ = crate::persist::save_recents(p, &self.engine.recents);
+        }
+    }
+
+    /// Delete on a recent row: forget it (the app/file/clip itself is untouched).
+    pub fn forget_selected_recent(&mut self) -> bool {
+        let Some(h) = self.hits.get(self.selected).cloned() else {
+            return false;
+        };
+        if !is_recent_hit(&h) || !self.engine.recents.remove(&h.id) {
+            return false;
+        }
+        self.save_recents();
+        let sel = self.selected;
+        let q = self.query.clone();
+        let caret = self.caret;
+        self.set_query_keep_caret(&q, caret);
+        self.selected = sel.min(self.hits.len().saturating_sub(1));
+        true
+    }
+
+    /// Ghost text after the prompt, from history. Only with the caret at the end.
+    pub fn inline_completion(&self) -> Option<String> {
+        if self.composing() || self.caret != self.query.chars().count() {
+            return None;
+        }
+        self.engine.completion(&self.query)
+    }
+
+    /// Tab / → at the end: take the ghost text into the prompt.
+    pub fn accept_completion(&mut self) -> bool {
+        let Some(rest) = self.inline_completion() else {
+            return false;
+        };
+        let q = format!("{}{rest}", self.query);
+        self.set_query(&q);
+        true
+    }
+
+    /// Tab / Shift+Tab: step through rows and wrap (home = recent history).
+    pub fn cycle_selection(&mut self, back: bool) {
+        let n = self.hits.len();
+        if n == 0 {
+            return;
+        }
+        self.selected = if back {
+            (self.selected + n - 1) % n
+        } else {
+            (self.selected + 1) % n
+        };
+    }
+
+    /// Footer hint under the rows; home gets one once there is history.
+    pub fn footer(&self) -> Option<String> {
+        if !self.composing() && crate::search::is_home_query(&self.query) {
+            return self
+                .hits
+                .iter()
+                .any(is_recent_hit)
+                .then(|| "↵ open    tab next    ↑↓ select    del forget    esc hide".to_string());
+        }
+        if self.inline_completion().is_some() {
+            return Some("↵ open    tab complete    ↑↓ select    esc hide".to_string());
+        }
+        crate::search::blade_footer(&self.query, self.composing()).map(str::to_string)
+    }
+
+    fn execute_current_inner(&mut self) -> Result<Outcome, String> {
         let route = self.engine.route_str(&self.query);
         match route {
             Route::Calc { expr } => {
@@ -357,6 +511,7 @@ impl Launcher {
                 self.run_action(&ResolvedAction::Shell { cmdline, admin: elevate })
             }
             Route::Url { url } => self.run_action(&ResolvedAction::OpenUrl(url)),
+            Route::Keyword { .. } if self.selected > 0 => self.execute_selected_hit(),
             Route::Keyword { name, arg } => {
                 let kw = find_keyword(&self.engine.keywords, &name)
                     .ok_or_else(|| format!("unknown keyword {name}"))?;
@@ -427,6 +582,9 @@ impl Launcher {
             };
             self.set_query(&q);
             return Ok(Outcome::Listed(self.hits.clone()));
+        }
+        if let Some(typed) = hit.id.strip_prefix("run:") {
+            return self.execute_query(typed);
         }
         if let Some(url) = hit.id.strip_prefix("bm:") {
             return self.run_action(&ResolvedAction::OpenUrl(url.to_string()));
@@ -580,6 +738,8 @@ impl Launcher {
     pub fn clear_clips(&mut self) -> Result<Outcome, String> {
         let _n = self.clips.clear_all().map_err(|e| e.to_string())?;
         self.clip_preview = None;
+        self.engine.recents.retain(|x| x.kind != HitKind::Clip);
+        self.save_recents();
         self.set_query("/clip");
         Ok(Outcome::Listed(self.hits.clone()))
     }
@@ -601,6 +761,9 @@ impl Launcher {
             return Err("clip already gone".into());
         }
         self.clip_preview = None;
+        if self.engine.recents.remove(&hit.id) {
+            self.save_recents();
+        }
         let q = if self.query.trim().is_empty() {
             "/clip".into()
         } else {
@@ -911,6 +1074,36 @@ impl Launcher {
     }
 }
 
+/// `recents.json` keeps no clip text; fill titles from `clipboard.db` and drop
+/// clips that were deleted or trimmed while Katana was closed.
+fn refresh_clip_recents(recents: &mut katana_core::Recents, clips: &ClipStore) {
+    let mut fresh = Vec::new();
+    for x in recents.items() {
+        if x.kind != HitKind::Clip {
+            continue;
+        }
+        let item = x
+            .id
+            .strip_prefix("clip:")
+            .and_then(|s| s.parse::<i64>().ok())
+            .and_then(|id| clips.get(id).ok().flatten());
+        fresh.push((x.id.clone(), item.map(crate::search::clip_hit)));
+    }
+    for (id, hit) in fresh {
+        match hit {
+            Some(h) => {
+                if let Some(x) = recents.get_mut(&id) {
+                    x.title = h.title;
+                    x.subtitle = h.subtitle;
+                }
+            }
+            None => {
+                recents.remove(&id);
+            }
+        }
+    }
+}
+
 fn fit_thumb(w: u32, h: u32, max_w: u32, max_h: u32) -> (u32, u32) {
     if w == 0 || h == 0 {
         return (1, 1);
@@ -1136,6 +1329,113 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn recents_cycle_on_home_and_complete_while_typing() {
+        let mut l = launch();
+        assert!(l.footer().is_none(), "no history yet: plain home");
+        l.execute_query("g rust lifetimes").unwrap();
+        l.execute_query("g rust").unwrap();
+        l.execute_query("=2+2").unwrap(); // calc is not history
+        l.set_query("");
+        let ids: Vec<_> = l.hits.iter().take(2).map(|h| h.id.as_str()).collect();
+        assert_eq!(ids, ["run:g rust", "run:g rust lifetimes"], "newest first on home");
+        assert!(l.hits.iter().any(|h| h.id == "cmd:/todo"), "commands stay under recents");
+        assert!(l.footer().unwrap().contains("tab next"));
+        l.cycle_selection(false);
+        assert_eq!(l.selected, 1);
+        l.cycle_selection(true);
+        l.cycle_selection(true);
+        assert_eq!(l.selected, l.hits.len() - 1, "Shift+Tab wraps to the end");
+
+        l.set_query("g r");
+        assert_eq!(l.inline_completion().as_deref(), Some("ust"));
+        assert!(l.accept_completion());
+        assert_eq!(l.query, "g rust");
+        assert_eq!(l.caret, 6);
+        // The keyword row stays first; the longer earlier run sits under it.
+        assert_eq!(l.hits[0].id, "kw:g");
+        assert_eq!(l.hits[1].id, "run:g rust lifetimes");
+        l.selected = 1;
+        match l.execute_current().unwrap() {
+            Outcome::Ran(s) => assert!(s.contains("rust%20lifetimes"), "{s}"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(l.engine.recents.items()[0].id, "run:g rust lifetimes");
+        assert_eq!(l.engine.recents.len(), 2, "replay does not duplicate");
+        l.set_query("/k g");
+        assert!(l.inline_completion().is_none(), "no ghost inside / blades");
+    }
+
+    #[test]
+    fn recent_app_ranks_first_and_completes() {
+        let mut l = launch();
+        let code = Hit::new(
+            "app:C:\\Apps\\Code.exe",
+            "Visual Studio Code",
+            "Application",
+            0.4,
+            HitKind::App,
+        );
+        l.hits = vec![code];
+        l.selected = 0;
+        assert!(matches!(l.execute_current(), Ok(Outcome::Ran(_))), "launch records it");
+        l.set_query("vi");
+        assert_eq!(l.hits[0].id, "app:C:\\Apps\\Code.exe", "{:?}", l.hits);
+        assert!(is_recent_hit(&l.hits[0]));
+        assert_eq!(l.inline_completion().as_deref(), Some("sual Studio Code"));
+        l.set_query("code");
+        assert_eq!(l.hits[0].title, "Visual Studio Code", "word prefix also ranks it first");
+        assert!(l.inline_completion().is_none(), "ghost only for a true prefix");
+        l.caret = 1;
+        assert!(l.inline_completion().is_none(), "caret not at end");
+    }
+
+    #[test]
+    fn pasted_clips_join_recents_and_follow_deletes() {
+        let mut l = launch();
+        l.ingest_clipboard_text("ssh rajiv@build-box").unwrap();
+        l.ingest_clipboard_text("other").unwrap();
+        l.set_query("/clip");
+        l.selected = l.hits.iter().position(|h| h.title.starts_with("ssh ")).unwrap();
+        l.execute_current().unwrap();
+        l.set_query("");
+        assert_eq!(l.hits[0].title, "ssh rajiv@build-box");
+        assert_eq!(l.hits[0].kind, HitKind::Clip);
+        l.set_query("ssh");
+        assert_eq!(l.hits[0].kind, HitKind::Clip, "clip type-ahead: {:?}", l.hits);
+        assert!(l.inline_completion().is_none(), "clip text is never ghosted into the prompt");
+        // Deleting the clip in /clip drops it from recents too.
+        l.set_query("/clip ssh");
+        l.selected = 0;
+        l.delete_selected_clip().unwrap();
+        assert!(l.engine.recents.is_empty());
+        l.set_query("");
+        assert!(l.hits.iter().all(|h| !is_recent_hit(h)), "{:?}", l.hits);
+    }
+
+    #[test]
+    fn delete_forgets_a_recent_and_history_survives_restart() {
+        let dir = tmp("recents-disk");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("recents.json");
+        {
+            let mut l = launch();
+            l.recents_path = Some(path.clone());
+            l.execute_query("g one").unwrap();
+            l.execute_query("g two").unwrap();
+            l.set_query("");
+            l.selected = 0;
+            assert!(l.forget_selected_recent());
+            assert_eq!(l.hits[0].id, "run:g one");
+            l.selected = l.hits.iter().position(|h| h.id == "cmd:/todo").unwrap();
+            assert!(!l.forget_selected_recent(), "commands are not history");
+        }
+        let back = crate::persist::load_recents(&path);
+        let ids: Vec<_> = back.items().iter().map(|x| x.id.as_str()).collect();
+        assert_eq!(ids, ["run:g one"]);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

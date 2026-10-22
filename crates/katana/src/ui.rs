@@ -98,6 +98,7 @@ mod win {
     const VK_DELETE: u16 = 0x2E;
     const VK_LEFT: u16 = 0x25;
     const VK_RIGHT: u16 = 0x27;
+    const VK_TAB: u16 = 0x09;
     const VK_HOME: u16 = 0x24;
     const VK_END: u16 = 0x23;
     const VK_PRIOR: u16 = 0x21;
@@ -313,7 +314,23 @@ mod win {
                     VK_RIGHT => {
                         if let Ok(mut g) = STATE.lock() {
                             if let Some(ln) = g.as_mut() {
-                                ln.move_caret(1);
+                                // → at the end takes the ghost completion, like a shell.
+                                if !ln.accept_completion() {
+                                    ln.move_caret(1);
+                                }
+                            }
+                        }
+                        relayout(hwnd);
+                    }
+                    VK_TAB => {
+                        if let Ok(mut g) = STATE.lock() {
+                            if let Some(ln) = g.as_mut() {
+                                // Tab: take the ghost completion, else step through rows
+                                // (home = recent history); Shift+Tab steps back. Wraps.
+                                if !ln.composing() && (shift_down() || !ln.accept_completion()) {
+                                    ln.cycle_selection(shift_down());
+                                    ln.ensure_file_scroll();
+                                }
                             }
                         }
                         relayout(hwnd);
@@ -394,9 +411,16 @@ mod win {
                                 }
                             }
                             relayout(hwnd);
-                        } else if let Ok(mut g) = STATE.lock() {
-                            if let Some(ln) = g.as_mut() {
-                                ln.delete_at_caret();
+                        } else {
+                            // Drop the lock before relayout, which takes it again.
+                            if let Ok(mut g) = STATE.lock() {
+                                if let Some(ln) = g.as_mut() {
+                                    // Delete on a recent row with an empty prompt forgets it.
+                                    let home = crate::search::is_home_query(&ln.query);
+                                    if !(home && ln.forget_selected_recent()) {
+                                        ln.delete_at_caret();
+                                    }
+                                }
                             }
                             relayout(hwnd);
                         }
@@ -654,7 +678,7 @@ mod win {
                     let preview = sel
                         .map(crate::search::clip_hit_is_image)
                         .unwrap_or(false);
-                    let footer = crate::search::blade_footer(&l.query, l.composing()).is_some();
+                    let footer = l.footer().is_some();
                     (
                         l.hits.len(),
                         crate::search::is_file_blade(&l.query),
@@ -1233,7 +1257,7 @@ mod win {
         let (font, small) = overlay_fonts();
         let old_f = SelectObject(hdc, font);
 
-        let (q, prompt, rows, sel, composing, file_sort, file_desc, file_scroll, caret_i) = {
+        let (q, prompt, rows, sel, file_sort, file_desc, file_scroll, caret_i, ghost, footer) = {
             let g = STATE.lock().ok();
             match g.as_ref().and_then(|x| x.as_ref()) {
                 Some(ln) => (
@@ -1241,22 +1265,24 @@ mod win {
                     ln.prompt_text(),
                     ln.hits.clone(),
                     ln.selected,
-                    ln.composing(),
                     ln.file_sort,
                     ln.file_sort_desc,
                     ln.file_scroll,
                     ln.prompt_caret_index(),
+                    ln.inline_completion(),
+                    ln.footer(),
                 ),
                 None => (
                     String::new(),
                     String::new(),
                     Vec::new(),
                     0,
-                    false,
                     crate::search::FileSort::Score,
                     false,
                     0,
                     0,
+                    None,
+                    None,
                 ),
             }
         };
@@ -1276,6 +1302,13 @@ mod win {
         let _ = IntersectClipRect(hdc, pad_l, 8, rc.right - pad_r, H_BAR);
         let wide: Vec<u16> = shown_prompt.encode_utf16().collect();
         let _ = TextOutW(hdc, x0, 18, &wide);
+        if let (false, Some(g)) = (empty, ghost.as_deref()) {
+            // Type-ahead from history, dimmed after the caret (Tab / → accepts).
+            SetTextColor(hdc, COLORREF(MUTED));
+            let gw: Vec<u16> = g.encode_utf16().collect();
+            let _ = TextOutW(hdc, x0 + text_px(hdc, shown_prompt), 18, &gw);
+            SetTextColor(hdc, COLORREF(TEXT));
+        }
         if !empty {
             let cx = (x0 + caret_px).clamp(pad_l, rc.right - pad_r - 2);
             let caret_br = CreateSolidBrush(COLORREF(ACCENT));
@@ -1474,7 +1507,7 @@ mod win {
                 + shown as i32 * row_h
                 + 6
                 + if file_mode { 20 } else { 0 };
-            if let Some(foot) = crate::search::blade_footer(&q, composing) {
+            if let Some(foot) = footer.as_deref() {
                 let foot: Vec<u16> = foot.encode_utf16().collect();
                 let _ = TextOutW(hdc, 20, foot_y, &foot);
             }

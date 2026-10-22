@@ -2,8 +2,8 @@
 
 use katana_clip::ClipStore;
 use katana_core::{
-    default_keywords, eval_calc, find_keyword, merge_hits, route, score_hit, Query, Route,
-    Hit, HitKind,
+    default_keywords, eval_calc, find_keyword, merge_hits, prepend_recents, route, score_hit,
+    Hit, HitKind, Query, RecentItem, Recents, Route, TYPEAHEAD_MAX,
 };
 use katana_index::NameIndex;
 use katana_todo::Store as TodoStore;
@@ -16,7 +16,8 @@ pub struct Engine {
     pub apps: Vec<AppEntry>,
     pub files: NameIndex,
     pub bookmarks: Vec<Bookmark>,
-    pub recents: Vec<Hit>,
+    /// Recently used apps, files, keywords, commands, and pasted clips.
+    pub recents: Recents,
 }
 
 impl Engine {
@@ -26,7 +27,7 @@ impl Engine {
             apps,
             files,
             bookmarks: Vec::new(),
-            recents: Vec::new(),
+            recents: Recents::default(),
         }
     }
 
@@ -65,14 +66,19 @@ impl Engine {
     ) -> Vec<Hit> {
         match route {
             Route::Recents => {
-                if self.recents.is_empty() {
-                    command_hits()
-                } else {
-                    self.recents.clone()
-                }
+                let mut hits = self
+                    .recents
+                    .hits(HOME_RECENTS, |x| recent_still_there(x, clips));
+                hits.extend(command_hits());
+                hits
             }
             Route::Shortcuts { query } | Route::Launch { query } | Route::Apps { query } => {
-                launch_hits(self, query, limit)
+                let hits = launch_hits(self, query, limit);
+                let rec = self.recents.matches(query, TYPEAHEAD_MAX, |x| {
+                    matches!(x.kind, HitKind::Keyword | HitKind::App | HitKind::Shell)
+                        && recent_still_there(x, clips)
+                });
+                prepend_recents(rec, hits, limit)
             }
             Route::Calc { expr } => {
                 let title = match eval_calc(expr) {
@@ -98,13 +104,25 @@ impl Engine {
                         _ if kw.url.is_some() => "ctrl+v pastes the search".into(),
                         _ => String::new(),
                     };
-                    vec![Hit::new(
+                    let mut hits = vec![Hit::new(
                         format!("kw:{name}"),
                         kw.names[0].clone(),
                         hint,
                         1.0,
                         HitKind::Keyword,
-                    )]
+                    )];
+                    // Earlier runs of this keyword (`g rust`, `g rust lifetimes`) under the typed one.
+                    let typed = match arg {
+                        Some(a) if !a.is_empty() => format!("{name} {a}"),
+                        _ => name.clone(),
+                    };
+                    let rec = self.recents.matches(&typed, TYPEAHEAD_MAX, |x| {
+                        x.id.strip_prefix("run:").is_some_and(|t| {
+                            t != typed && t.to_lowercase().starts_with(&typed.to_lowercase())
+                        })
+                    });
+                    hits.extend(rec);
+                    hits
                 } else {
                     Vec::new()
                 }
@@ -119,7 +137,10 @@ impl Engine {
                 for f in self.files.search(q, limit) {
                     hits.push(file_hit(f));
                 }
-                merge_hits(dedupe_by_path(hits, true), limit)
+                let rec = self.recents.matches(q, TYPEAHEAD_MAX, |x| {
+                    matches!(x.kind, HitKind::File | HitKind::App)
+                });
+                prepend_recents(rec, merge_hits(dedupe_by_path(hits, true), limit), limit)
             }
             Route::Clip { query } => {
                 let Some(store) = clips else {
@@ -139,34 +160,7 @@ impl Engine {
                 } else {
                     Vec::new()
                 };
-                hits.extend(items.into_iter().map(|c| {
-                    let image = c.kind == "image";
-                    let title = if image {
-                        match (c.width, c.height) {
-                            (Some(w), Some(h)) => format!("Image  {w}×{h}"),
-                            _ => "Image".into(),
-                        }
-                    } else {
-                        c.text.unwrap_or_else(|| format!("[{}]", c.kind))
-                    };
-                    Hit::new(
-                        format!("clip:{}", c.id),
-                        title,
-                        if c.pinned {
-                            if image {
-                                "pinned image".into()
-                            } else {
-                                "pinned".into()
-                            }
-                        } else if image {
-                            "image".into()
-                        } else {
-                            c.kind
-                        },
-                        1.0,
-                        HitKind::Clip,
-                    )
-                }));
+                hits.extend(items.into_iter().map(clip_hit));
                 hits
             }
             Route::Todo { rest } => {
@@ -286,10 +280,70 @@ impl Engine {
                 for f in self.files.search(query, limit) {
                     hits.push(file_hit(f));
                 }
-                merge_hits(dedupe_by_path(hits, false), limit)
+                // Type-ahead: things you used before jump to the top as you type.
+                let rec = self
+                    .recents
+                    .matches(query, TYPEAHEAD_MAX, |x| recent_still_there(x, clips));
+                prepend_recents(rec, merge_hits(dedupe_by_path(hits, false), limit), limit)
             }
         }
     }
+
+    /// Ghost text after the prompt: the rest of the newest recent that starts with `raw`.
+    /// Only for plain search and keywords, not inside `/` blades.
+    pub fn completion(&self, raw: &str) -> Option<String> {
+        if raw.trim_start().starts_with('/') {
+            return None;
+        }
+        self.recents.completion(raw)
+    }
+}
+
+/// Recent rows shown on the home screen, above the command list.
+pub const HOME_RECENTS: usize = 12;
+
+/// A pasted clip that was deleted or trimmed from history is not offered again.
+fn recent_still_there(x: &RecentItem, clips: Option<&ClipStore>) -> bool {
+    if x.kind != HitKind::Clip {
+        return true;
+    }
+    let Some(id) = x.id.strip_prefix("clip:").and_then(|s| s.parse::<i64>().ok()) else {
+        return false;
+    };
+    match clips {
+        Some(store) => matches!(store.get(id), Ok(Some(_))),
+        None => false,
+    }
+}
+
+/// One clipboard history row.
+pub fn clip_hit(c: katana_clip::ClipItem) -> Hit {
+    let image = c.kind == "image";
+    let title = if image {
+        match (c.width, c.height) {
+            (Some(w), Some(h)) => format!("Image  {w}×{h}"),
+            _ => "Image".into(),
+        }
+    } else {
+        c.text.unwrap_or_else(|| format!("[{}]", c.kind))
+    };
+    Hit::new(
+        format!("clip:{}", c.id),
+        title,
+        if c.pinned {
+            if image {
+                "pinned image".into()
+            } else {
+                "pinned".into()
+            }
+        } else if image {
+            "image".into()
+        } else {
+            c.kind
+        },
+        1.0,
+        HitKind::Clip,
+    )
 }
 
 /// Mark the alias letter: `/todo` + `t` → `/[t]odo`.
@@ -486,9 +540,10 @@ pub fn is_file_blade(q: &str) -> bool {
     matches!(katana_core::slash_verb(q), Some("f" | "file" | "files"))
 }
 
-/// File browser, clipboard history, and todo list share wheel + scrollbar.
+/// File browser, clipboard history, todo list, and home (recents + commands)
+/// share wheel + scrollbar.
 pub fn list_scroll_mode(q: &str) -> bool {
-    is_file_blade(q) || is_clip_blade(q) || todo_list_mode(q)
+    is_home_query(q) || is_file_blade(q) || is_clip_blade(q) || todo_list_mode(q)
 }
 
 /// Visible page size for scrollable lists (matches overlay MAX_ROWS / FILE_PAGE).
@@ -1111,7 +1166,8 @@ mod tests {
         assert!(!todo_list_mode("/todo add milk"));
         assert!(list_scroll_mode("/f ") && list_scroll_mode("/clip") && list_scroll_mode("/todo"));
         assert!(list_scroll_mode("/todo showall") && !list_scroll_mode("/todo add milk"));
-        assert!(!list_scroll_mode("") && !list_scroll_mode("/shot"));
+        assert!(list_scroll_mode(""), "home scrolls once recents push it past a page");
+        assert!(!list_scroll_mode("/shot"));
         assert_eq!(list_page("/clip"), FILE_PAGE);
         assert!(blade_footer("/todo", false).unwrap().contains("/ 0..100"));
     }

@@ -4,6 +4,7 @@ mod calc;
 mod keyword;
 mod query;
 mod rank;
+mod recents;
 mod tokens;
 
 pub use calc::{eval_calc, CalcError};
@@ -13,6 +14,10 @@ pub use keyword::{
 };
 pub use query::{route, parse_shot_rest, Query, Route, ShotMode};
 pub use rank::{fuzzy_score, merge_hits, score_hit, FuzzyEngine, Hit, HitKind, PreparedQuery};
+pub use recents::{
+    is_recent_hit, prepend_recents, replay_text, strip_recent_label, RecentItem, Recents,
+    RECENTS_CAP, RECENT_LABEL, TYPEAHEAD_MAX,
+};
 pub use tokens::{expand_tokens, sanitize_url_arg};
 
 /// First `/verb` of a palette query, without the slash. `"/todo showall"` → `Some("todo")`.

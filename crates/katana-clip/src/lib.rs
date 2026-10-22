@@ -208,6 +208,15 @@ impl ClipStore {
         Ok(())
     }
 
+    /// One clip by id (text or image metadata), `None` once it is deleted or trimmed.
+    pub fn get(&self, id: i64) -> Result<Option<ClipItem>, ClipError> {
+        let item = self
+            .conn
+            .query_row(&format!("{CLIP_SELECT} WHERE id = ?1"), [id], clip_from_row)
+            .optional()?;
+        Ok(item)
+    }
+
     pub fn get_image(&self, id: i64) -> Result<Option<Vec<u8>>, ClipError> {
         let b = self
             .conn
@@ -289,7 +298,9 @@ mod tests {
         let s = ClipStore::open(&path).unwrap();
         let a = s.record_text("keep").unwrap().unwrap();
         let b = s.record_text("gone").unwrap().unwrap();
+        assert_eq!(s.get(b).unwrap().unwrap().text.as_deref(), Some("gone"));
         assert!(s.delete(b).unwrap());
+        assert!(s.get(b).unwrap().is_none(), "deleted clip is gone by id");
         let left = s.list(10).unwrap();
         assert_eq!(left.len(), 1);
         assert_eq!(left[0].id, a);
