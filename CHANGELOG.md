@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.6 — 2026-10-18
+
+### Keywords
+- **Tab** completes a keyword from a prefix (`you` → `youtube `). Tab again cycles matches; Shift+Tab goes back
+- Empty Tab fills the last keyword you ran. Katana remembers it in `%APPDATA%\Katana\config.toml`
+
 ## 0.3.5 — 2026-10-08
 
 ### UI
