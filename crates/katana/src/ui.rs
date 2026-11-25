@@ -107,7 +107,6 @@ mod win {
     const VK_MENU: u16 = 0x12;
     const VK_V: u16 = 0x56;
     const VK_INSERT: u16 = 0x2D;
-    const VK_TAB: u16 = 0x09;
     const WM_SYSKEYDOWN: u32 = 0x0104;
 
     const PALETTE_W: i32 = 640;
@@ -256,7 +255,7 @@ mod win {
                 if vk == VK_TAB && !ctrl_down() {
                     if let Ok(mut g) = STATE.lock() {
                         if let Some(ln) = g.as_mut() {
-                            let _ = ln.tab_complete(shift_down());
+                            ln.handle_tab(shift_down());
                         }
                     }
                     relayout(hwnd);
@@ -327,19 +326,6 @@ mod win {
                                 // → at the end takes the ghost completion, like a shell.
                                 if !ln.accept_completion() {
                                     ln.move_caret(1);
-                                }
-                            }
-                        }
-                        relayout(hwnd);
-                    }
-                    VK_TAB => {
-                        if let Ok(mut g) = STATE.lock() {
-                            if let Some(ln) = g.as_mut() {
-                                // Tab: take the ghost completion, else step through rows
-                                // (home = recent history); Shift+Tab steps back. Wraps.
-                                if !ln.composing() && (shift_down() || !ln.accept_completion()) {
-                                    ln.cycle_selection(shift_down());
-                                    ln.ensure_file_scroll();
                                 }
                             }
                         }
