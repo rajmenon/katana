@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.3.7 — 2026-11-25
+
+### Recents
+- Enter remembers apps, files, folders, bookmarks, keyword lines (`g rust lifetimes`), `>` commands, URLs, and pasted clips. Newest first, capped at 50, in `%APPDATA%\Katana\recents.json`
+- An empty prompt lists them above the commands. Tab and Shift+Tab move through them; Delete forgets one
+- While typing, a matching recent ranks first and the rest of it shows in grey. Tab or → accepts it when the word is not a keyword prefix
+- A clip recent stores only the clipboard row id. Deleting that clip, or clearing history, drops it
+
+### Keywords
+- Tab still completes a keyword prefix (`you` → `youtube `). Tab again cycles matches; Shift+Tab goes back
+- Empty Tab still fills the last keyword when no recent is listed
+
 ## 0.3.6 — 2026-10-18
 
 ### Keywords

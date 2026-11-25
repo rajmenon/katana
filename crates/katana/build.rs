@@ -16,13 +16,40 @@ fn main() {
         .arg(&res)
         .arg(&rc)
         .status();
-    if matches!(status, Ok(s) if s.success()) {
-        println!("cargo:rustc-link-arg={}", res.display());
+    if !matches!(status, Ok(s) if s.success()) {
+        return;
     }
+    // MSVC link.exe takes the .res. GNU ld does not, so windres makes a COFF object.
+    let link = if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("gnu") {
+        let Some(windres) = find_windres() else {
+            return;
+        };
+        let obj = std::path::Path::new(&out).join("katana.o");
+        let status = std::process::Command::new(windres)
+            .args(["-O", "coff", "-i"])
+            .arg(&res)
+            .arg("-o")
+            .arg(&obj)
+            .status();
+        if !matches!(status, Ok(s) if s.success()) {
+            return;
+        }
+        obj
+    } else {
+        res
+    };
+    println!("cargo:rustc-link-arg={}", link.display());
 }
 
 fn find_rc() -> Option<std::path::PathBuf> {
     if let Ok(p) = which("rc.exe") {
+        return Some(p);
+    }
+    // Cross builds: llvm-rc accepts the same /nologo /fo arguments.
+    if let Ok(p) = which("llvm-rc") {
+        return Some(p);
+    }
+    if let Ok(p) = which("llvm-rc.exe") {
         return Some(p);
     }
     // Typical VS / Windows SDK locations.
@@ -41,6 +68,23 @@ fn find_rc() -> Option<std::path::PathBuf> {
         }
     }
     None
+}
+
+fn find_windres() -> Option<std::path::PathBuf> {
+    if let Ok(p) = std::env::var("WINDRES") {
+        let p = std::path::PathBuf::from(p);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    if let Ok(target) = std::env::var("TARGET") {
+        if let Some(arch) = target.strip_suffix("-pc-windows-gnu") {
+            if let Ok(p) = which(&format!("{arch}-w64-mingw32-windres")) {
+                return Some(p);
+            }
+        }
+    }
+    which("windres").ok()
 }
 
 fn which(name: &str) -> Result<std::path::PathBuf, ()> {
