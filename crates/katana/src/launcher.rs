@@ -2,8 +2,8 @@
 
 use katana_clip::ClipStore;
 use katana_core::{
-    find_keyword, keyword_complete_stem, keyword_completions, parse_shot_rest, resolve_keyword,
-    Hit, ResolvedAction, Route, ShotMode,
+    find_keyword, is_recent_hit, keyword_complete_stem, keyword_completions, parse_shot_rest,
+    resolve_keyword, Hit, HitKind, ResolvedAction, Route, ShotMode,
 };
 use katana_index::NameIndex;
 use katana_shot::{dib_from_bgra, png_from_bgra, PhysRect};
@@ -388,6 +388,43 @@ impl Launcher {
         true
     }
 
+    /// Tab from the prompt, keeping both keyword completion and recent history.
+    ///
+    /// A keyword prefix still completes (`you` → `youtube`; Tab again cycles,
+    /// Shift+Tab goes back). An empty prompt that already lists recents steps
+    /// through those rows — both features want Tab there, and the list is what
+    /// is on screen. With no history, empty Tab still restores the last keyword.
+    /// Otherwise Tab takes the ghost completion; Shift+Tab, or no ghost, steps
+    /// through the rows.
+    pub fn handle_tab(&mut self, reverse: bool) {
+        if self.keyword_tab_applies() && self.tab_complete(reverse) {
+            return;
+        }
+        if !self.composing() && (reverse || !self.accept_completion()) {
+            self.cycle_selection(reverse);
+            self.ensure_file_scroll();
+        }
+    }
+
+    /// Keyword completion owns Tab, except on an empty home list that has history.
+    fn keyword_tab_applies(&self) -> bool {
+        if self.composing() {
+            return false;
+        }
+        if crate::search::is_home_query(&self.query) && self.hits.iter().any(is_recent_hit) {
+            return false;
+        }
+        let Some(typed) = keyword_complete_stem(&self.query) else {
+            return false;
+        };
+        let stem = if self.tab_active {
+            self.tab_stem.as_str()
+        } else {
+            typed.as_str()
+        };
+        !keyword_completions(stem, &self.engine.keywords, self.last_keyword.as_deref()).is_empty()
+    }
+
     fn remember_keyword(&mut self, name: &str) {
         let name = name.trim();
         if name.is_empty() || find_keyword(&self.engine.keywords, name).is_none() {
@@ -569,7 +606,7 @@ impl Launcher {
                 .any(is_recent_hit)
                 .then(|| "↵ open    tab next    ↑↓ select    del forget    esc hide".to_string());
         }
-        if self.inline_completion().is_some() {
+        if self.inline_completion().is_some() && !self.keyword_tab_applies() {
             return Some("↵ open    tab complete    ↑↓ select    esc hide".to_string());
         }
         crate::search::blade_footer(&self.query, self.composing()).map(str::to_string)
@@ -2005,5 +2042,42 @@ mod tests {
         l.set_query("g rust");
         assert!(!l.tab_complete(false));
         assert_eq!(l.query, "g rust");
+    }
+
+    #[test]
+    fn tab_key_cycles_recents_and_still_completes_keywords() {
+        let mut l = launch();
+        l.execute_query("g rust lifetimes").unwrap();
+        l.execute_query("youtube").unwrap();
+        l.set_query("");
+        assert!(l.hits.iter().any(is_recent_hit));
+        // History is on screen, so Tab walks it instead of inserting the last keyword.
+        l.handle_tab(false);
+        assert_eq!(l.query, "");
+        assert_eq!(l.selected, 1);
+        l.handle_tab(true);
+        assert_eq!(l.selected, 0);
+
+        l.set_query("g r");
+        assert_eq!(l.inline_completion().as_deref(), Some("ust lifetimes"));
+        l.handle_tab(false);
+        assert_eq!(l.query, "g rust lifetimes");
+
+        l.set_query("you");
+        l.handle_tab(false);
+        assert_eq!(l.query, "youtube ");
+        l.set_query("g");
+        l.handle_tab(false);
+        assert_eq!(l.query, "g ");
+        l.handle_tab(false);
+        assert_eq!(l.query, "gh ", "a second Tab cycles keyword matches");
+
+        // No history: empty Tab still restores the last keyword.
+        l.set_query("");
+        while l.forget_selected_recent() {}
+        l.set_query("");
+        assert!(l.hits.iter().all(|h| !is_recent_hit(h)));
+        l.handle_tab(false);
+        assert_eq!(l.query, "youtube ");
     }
 }
