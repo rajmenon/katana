@@ -28,6 +28,22 @@ pub struct RecEvent {
     pub kind: RecEventKind,
     pub path: PathBuf,
     pub detail: String,
+    /// Screen pixels being encoded, `(x, y, w, h)`. Zero size if unknown.
+    pub bounds: (i32, i32, i32, i32),
+}
+
+fn rec_event(
+    kind: RecEventKind,
+    path: PathBuf,
+    detail: impl Into<String>,
+    bounds: (i32, i32, i32, i32),
+) -> RecEvent {
+    RecEvent {
+        kind,
+        path,
+        detail: detail.into(),
+        bounds,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -158,6 +174,135 @@ pub fn h264_bitrate(width: u32, height: u32, fps: u32) -> u32 {
 }
 
 /// H.264 level_idc rough enough for the inbox encoder.
+/// Red stroke just outside the hole, then a short dim halo beyond that.
+pub const OUTLINE_RED: i32 = 2;
+pub const OUTLINE_DIM: i32 = 6;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Outline {
+    pub x: i32,
+    pub y: i32,
+    pub w: i32,
+    pub h: i32,
+    /// Transparent hole, in window coordinates. That hole is the captured rect.
+    pub hole_x: i32,
+    pub hole_y: i32,
+    pub hole_w: i32,
+    pub hole_h: i32,
+}
+
+/// Frame around the captured pixels. Each side sits just outside the capture
+/// when the virtual screen has room, and on the inner edge when it does not
+/// (a full-monitor recording, where "outside" would be off the screen).
+pub fn outline_geometry(
+    cap_x: i32,
+    cap_y: i32,
+    cap_w: i32,
+    cap_h: i32,
+    vx: i32,
+    vy: i32,
+    vw: i32,
+    vh: i32,
+) -> Outline {
+    let (x, hole_x, w, hole_w) = outline_axis(cap_x, cap_w, vx, vw);
+    let (y, hole_y, h, hole_h) = outline_axis(cap_y, cap_h, vy, vh);
+    Outline {
+        x,
+        y,
+        w,
+        h,
+        hole_x,
+        hole_y,
+        hole_w,
+        hole_h,
+    }
+}
+
+fn outline_axis(cap: i32, len: i32, screen: i32, screen_len: i32) -> (i32, i32, i32, i32) {
+    let len = len.max(0);
+    let screen_end = screen.saturating_add(screen_len);
+    let cap_end = cap.saturating_add(len);
+    let (before, inside_before) = if cap - (OUTLINE_RED + OUTLINE_DIM) >= screen {
+        (OUTLINE_RED + OUTLINE_DIM, 0)
+    } else if cap - OUTLINE_RED >= screen {
+        (OUTLINE_RED, 0)
+    } else {
+        (0, OUTLINE_RED.min(len / 2))
+    };
+    let (after, inside_after) = if cap_end + OUTLINE_RED + OUTLINE_DIM <= screen_end {
+        (OUTLINE_RED + OUTLINE_DIM, 0)
+    } else if cap_end + OUTLINE_RED <= screen_end {
+        (OUTLINE_RED, 0)
+    } else {
+        (0, OUTLINE_RED.min((len - inside_before) / 2))
+    };
+    let win = cap - before;
+    let win_len = (before + len + after).max(1);
+    let hole = before + inside_before;
+    let hole_len = (len - inside_before - inside_after).max(0);
+    (win, hole, win_len, hole_len)
+}
+
+/// Premultiplied BGRA for one overlay pixel. The hole is clear. The next
+/// 2px are red, then a short dim halo. Corners keep a slightly longer red mark.
+pub fn outline_pixel(
+    x: i32,
+    y: i32,
+    hole_x: i32,
+    hole_y: i32,
+    hole_w: i32,
+    hole_h: i32,
+) -> [u8; 4] {
+    let Some(dist) = outside_hole(x, y, hole_x, hole_y, hole_w, hole_h) else {
+        return [0, 0, 0, 0];
+    };
+    let corner = near_hole_corner(x, y, hole_x, hole_y, hole_w, hole_h);
+    let red_px = if corner { 4 } else { OUTLINE_RED };
+    if dist <= red_px {
+        // #E11D48, opaque, premultiplied.
+        [0x48, 0x1D, 0xE1, 0xFF]
+    } else if dist <= OUTLINE_RED + OUTLINE_DIM {
+        // Soft black halo, alpha 64.
+        [0, 0, 0, 64]
+    } else {
+        [0, 0, 0, 0]
+    }
+}
+
+fn outside_hole(x: i32, y: i32, hx: i32, hy: i32, hw: i32, hh: i32) -> Option<i32> {
+    if hw <= 0 || hh <= 0 {
+        return Some(99);
+    }
+    let right = hx + hw;
+    let bottom = hy + hh;
+    if x >= hx && x < right && y >= hy && y < bottom {
+        return None;
+    }
+    let dx = if x < hx {
+        hx - x
+    } else if x >= right {
+        x - (right - 1)
+    } else {
+        0
+    };
+    let dy = if y < hy {
+        hy - y
+    } else if y >= bottom {
+        y - (bottom - 1)
+    } else {
+        0
+    };
+    Some(dx.max(dy))
+}
+
+fn near_hole_corner(x: i32, y: i32, hx: i32, hy: i32, hw: i32, hh: i32) -> bool {
+    let right = hx + hw - 1;
+    let bottom = hy + hh - 1;
+    [(hx, hy), (right, hy), (hx, bottom), (right, bottom)]
+        .into_iter()
+        .any(|(cx, cy)| (x - cx).abs() <= 12 && (y - cy).abs() <= 12)
+}
+
 pub fn h264_level_idc(width: u32, height: u32) -> u32 {
     let px = (width as u64).saturating_mul(height as u64);
     if px <= 1280 * 720 {
@@ -365,33 +510,26 @@ mod win {
                         push_event(
                             hwnd_bits,
                             WM_REC_DONE,
-                            RecEvent {
-                                kind: RecEventKind::Saved,
-                                path,
-                                detail,
-                            },
+                            rec_event(RecEventKind::Saved, path, detail, (0, 0, 0, 0)),
                         );
                     }
                     Ok(SessionEnd::Fail(detail)) => {
                         push_event(
                             hwnd_bits,
                             WM_REC_FAIL,
-                            RecEvent {
-                                kind: RecEventKind::Failed,
-                                path: PathBuf::new(),
-                                detail,
-                            },
+                            rec_event(RecEventKind::Failed, PathBuf::new(), detail, (0, 0, 0, 0)),
                         );
                     }
                     Err(_) => {
                         push_event(
                             hwnd_bits,
                             WM_REC_FAIL,
-                            RecEvent {
-                                kind: RecEventKind::Failed,
-                                path: PathBuf::new(),
-                                detail: "recording stopped unexpectedly".into(),
-                            },
+                            rec_event(
+                                RecEventKind::Failed,
+                                PathBuf::new(),
+                                "recording stopped unexpectedly",
+                                (0, 0, 0, 0),
+                            ),
                         );
                     }
                 }
@@ -505,18 +643,25 @@ mod win {
         push_event(
             hwnd,
             WM_REC_BEGAN,
-            RecEvent {
-                kind: RecEventKind::Began,
-                path: path.clone(),
-                detail: String::new(),
-            },
+            rec_event(
+                RecEventKind::Began,
+                path.clone(),
+                "",
+                (
+                    capture.screen_x,
+                    capture.screen_y,
+                    capture.width as i32,
+                    capture.height as i32,
+                ),
+            ),
         );
 
         let mut last = match capture_first(&mut capture) {
             Ok(f) => f,
             Err(e) if e == "cancelled" || STOP.load(Ordering::SeqCst) => {
                 let _ = std::fs::remove_file(&path);
-                return SessionEnd::Quiet;
+                // The border is already up; a silent failure takes it down.
+                return SessionEnd::Fail("cancelled".into());
             }
             Err(e) => {
                 let _ = std::fs::remove_file(&path);
@@ -762,6 +907,9 @@ mod win {
         origin_y: u32,
         width: u32,
         height: u32,
+        /// Top-left of the encoded pixels, in virtual-screen coordinates.
+        screen_x: i32,
+        screen_y: i32,
     }
 
     fn open_capture(region: Option<(i32, i32, i32, i32)>, cursor: Option<(i32, i32)>) -> Result<Capture, String> {
@@ -862,6 +1010,8 @@ mod win {
                 origin_y: frame.y,
                 width: frame.w,
                 height: frame.h,
+                screen_x: mon.x + frame.x as i32,
+                screen_y: mon.y + frame.y as i32,
             })
         }
     }
@@ -1259,5 +1409,35 @@ mod tests {
         resample_to_48k(&mut prev, &mut phase, &frames, 44_100, &mut out);
         let samples = out.len() / 2;
         assert!((470..=490).contains(&samples), "{samples}");
+    }
+
+    #[test]
+    fn outline_sits_outside_a_region_and_on_a_full_monitor_edge() {
+        let screen = (0, 0, 1920, 1080);
+        let region = outline_geometry(100, 80, 400, 300, screen.0, screen.1, screen.2, screen.3);
+        assert_eq!(region.x, 100 - (OUTLINE_RED + OUTLINE_DIM));
+        assert_eq!(region.y, 80 - (OUTLINE_RED + OUTLINE_DIM));
+        assert_eq!(region.hole_x, OUTLINE_RED + OUTLINE_DIM);
+        assert_eq!(region.hole_y, OUTLINE_RED + OUTLINE_DIM);
+        assert_eq!((region.hole_w, region.hole_h), (400, 300));
+        // One pixel outside the hole is red; the hole itself is clear; further out is dim.
+        assert_eq!(
+            outline_pixel(region.hole_x - 1, region.hole_y, region.hole_x, region.hole_y, 400, 300),
+            [0x48, 0x1D, 0xE1, 0xFF]
+        );
+        assert_eq!(
+            outline_pixel(region.hole_x, region.hole_y, region.hole_x, region.hole_y, 400, 300),
+            [0, 0, 0, 0]
+        );
+        assert_eq!(
+            outline_pixel(region.hole_x - 4, region.hole_y + 20, region.hole_x, region.hole_y, 400, 300)[3],
+            64
+        );
+
+        let full = outline_geometry(0, 0, 1920, 1080, screen.0, screen.1, screen.2, screen.3);
+        assert_eq!((full.x, full.y, full.w, full.h), (0, 0, 1920, 1080));
+        assert_eq!((full.hole_x, full.hole_y), (OUTLINE_RED, OUTLINE_RED));
+        assert_eq!(outline_pixel(0, 10, full.hole_x, full.hole_y, full.hole_w, full.hole_h)[3], 0xFF);
+        assert_eq!(outline_pixel(2, 2, full.hole_x, full.hole_y, full.hole_w, full.hole_h), [0, 0, 0, 0]);
     }
 }

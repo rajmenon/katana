@@ -44,7 +44,7 @@ mod win {
     use windows::core::w;
     use windows::Win32::Foundation::{
         CloseHandle, GetLastError, COLORREF, ERROR_ALREADY_EXISTS, HANDLE, HWND, LPARAM, LRESULT,
-        POINT, RECT, WPARAM,
+        POINT, RECT, SIZE, WPARAM,
     };
     use windows::Win32::Graphics::Gdi::{
         BeginPaint, CreateFontW, CreatePen, CreateRoundRectRgn, CreateSolidBrush, DeleteObject,
@@ -66,13 +66,15 @@ mod win {
         PeekMessageW, PostMessageW, PostQuitMessage, RegisterClassW, SetForegroundWindow,
         SetWindowPos, ShowWindow, TrackPopupMenu, TranslateMessage, CS_DROPSHADOW, CS_HREDRAW,
         CS_VREDRAW,
-        HWND_TOPMOST, IDC_ARROW, IDC_HAND, MF_CHECKED, MF_STRING, MSG, PM_REMOVE, SM_CXSCREEN,
-        SM_CYSCREEN, SWP_NOACTIVATE, SWP_SHOWWINDOW, SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE,
+        HWND_TOPMOST, HTTRANSPARENT, IDC_ARROW, IDC_HAND, MF_CHECKED, MF_STRING, MSG, PM_REMOVE,
+        SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+        SM_YVIRTUALSCREEN, SWP_NOACTIVATE, SWP_SHOWWINDOW, SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE,
         TPM_BOTTOMALIGN,
         TPM_LEFTALIGN, TPM_RIGHTBUTTON, WM_ACTIVATE, WM_CHAR, WM_CLIPBOARDUPDATE, WM_COMMAND,
         KillTimer, SetTimer, WM_DESTROY, WM_HOTKEY, WM_KEYDOWN, WM_LBUTTONUP, WM_MOUSEWHEEL,
-        WM_PAINT, WM_TIMER, WNDCLASSW,
-        WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+        WM_NCHITTEST, WM_PAINT, WM_TIMER, WNDCLASSW,
+        WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT,
+        WS_POPUP,
     };
 
     const HOT_PALETTE: i32 = 1;
@@ -572,8 +574,13 @@ mod win {
                 LRESULT(0)
             }
             m if m == crate::record::WM_REC_BEGAN => {
-                let _ = crate::record::pop_event();
-                set_recording_chrome(hwnd, true);
+                if let Some(ev) = crate::record::pop_event() {
+                    set_recording_chrome(hwnd, true);
+                    let (x, y, w, h) = ev.bounds;
+                    if w > 1 && h > 1 {
+                        show_rec_outline(x, y, w, h);
+                    }
+                }
                 LRESULT(0)
             }
             m if m == crate::record::WM_REC_DONE => {
@@ -599,6 +606,7 @@ mod win {
             WM_DESTROY => {
                 crate::record::request_stop();
                 hide_rec_dot();
+                hide_rec_outline();
                 remove_tray(hwnd);
                 let _ = UnregisterHotKey(hwnd, HOT_PALETTE);
                 let _ = UnregisterHotKey(hwnd, HOT_CLIP);
@@ -974,6 +982,16 @@ mod win {
 
     static REC_DOT: AtomicIsize = AtomicIsize::new(0);
     static REC_ICON: AtomicIsize = AtomicIsize::new(0);
+    static REC_OUTLINE: AtomicIsize = AtomicIsize::new(0);
+
+    fn exclude_from_capture(hwnd: HWND) {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            SetWindowDisplayAffinity, WDA_EXCLUDEFROMCAPTURE,
+        };
+        unsafe {
+            let _ = SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE);
+        }
+    }
 
     fn set_recording_chrome(hwnd: HWND, on: bool) {
         if on {
@@ -981,6 +999,7 @@ mod win {
             set_tray_icon(hwnd, recording_icon());
         } else {
             hide_rec_dot();
+            hide_rec_outline();
             set_tray_icon(hwnd, load_app_icon());
         }
         refresh_tray_tip(hwnd);
@@ -1025,6 +1044,7 @@ mod win {
                 SetLayeredWindowAttributes, LWA_COLORKEY,
             };
             let _ = SetLayeredWindowAttributes(dot, COLORREF(0x00FF00FF), 0, LWA_COLORKEY);
+            exclude_from_capture(dot);
             REC_DOT.store(dot.0 as isize, Ordering::SeqCst);
             let _ = ShowWindow(dot, SW_SHOWNOACTIVATE);
         }
@@ -1036,6 +1056,164 @@ mod win {
             unsafe {
                 let _ = DestroyWindow(HWND(h as *mut _));
             }
+        }
+    }
+
+    fn show_rec_outline(cap_x: i32, cap_y: i32, cap_w: i32, cap_h: i32) {
+        use windows::Win32::Graphics::Gdi::{
+            CreateCompatibleDC, CreateDIBSection, DeleteDC, GetDC, ReleaseDC, AC_SRC_ALPHA,
+            AC_SRC_OVER, BLENDFUNCTION,
+        };
+            use windows::Win32::UI::WindowsAndMessaging::{UpdateLayeredWindow, ULW_ALPHA};
+        hide_rec_outline();
+        unsafe {
+            let vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+            let vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+            let vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+            let vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+            let frame = crate::record::outline_geometry(cap_x, cap_y, cap_w, cap_h, vx, vy, vw, vh);
+            if frame.w < 4 || frame.h < 4 || frame.w > 16_000 || frame.h > 16_000 {
+                return;
+            }
+            let Ok(hinst) = GetModuleHandleW(None) else {
+                return;
+            };
+            let class = w!("KatanaRecOutline");
+            let wc = WNDCLASSW {
+                style: CS_HREDRAW | CS_VREDRAW,
+                lpfnWndProc: Some(outline_proc),
+                hInstance: hinst.into(),
+                lpszClassName: class,
+                ..Default::default()
+            };
+            RegisterClassW(&wc);
+            let Ok(hwnd) = CreateWindowExW(
+                WS_EX_TRANSPARENT
+                    | WS_EX_LAYERED
+                    | WS_EX_TOOLWINDOW
+                    | WS_EX_NOACTIVATE
+                    | WS_EX_TOPMOST,
+                class,
+                w!("Katana recording"),
+                WS_POPUP,
+                frame.x,
+                frame.y,
+                frame.w,
+                frame.h,
+                None,
+                None,
+                hinst,
+                None,
+            ) else {
+                return;
+            };
+            exclude_from_capture(hwnd);
+            let pixels = outline_bitmap(&frame);
+            let screen = GetDC(HWND(std::ptr::null_mut()));
+            let mem = CreateCompatibleDC(screen);
+            let info = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: frame.w,
+                    biHeight: -frame.h,
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB.0 as u32,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let mut bits = std::ptr::null_mut();
+            let bmp = CreateDIBSection(screen, &info, DIB_RGB_COLORS, &mut bits, None, 0)
+                .unwrap_or_default();
+            if !bits.is_null() && !pixels.is_empty() {
+                std::ptr::copy_nonoverlapping(pixels.as_ptr(), bits.cast(), pixels.len());
+            }
+            let old = SelectObject(mem, bmp);
+            let dst = POINT { x: frame.x, y: frame.y };
+            let size = SIZE { cx: frame.w, cy: frame.h };
+            let src = POINT { x: 0, y: 0 };
+            let blend = BLENDFUNCTION {
+                BlendOp: AC_SRC_OVER as u8,
+                BlendFlags: 0,
+                SourceConstantAlpha: 255,
+                AlphaFormat: AC_SRC_ALPHA as u8,
+            };
+            let _ = UpdateLayeredWindow(
+                hwnd,
+                screen,
+                Some(&dst),
+                Some(&size),
+                mem,
+                Some(&src),
+                COLORREF(0),
+                Some(&blend),
+                ULW_ALPHA,
+            );
+            SelectObject(mem, old);
+            let _ = DeleteObject(bmp);
+            let _ = DeleteDC(mem);
+            ReleaseDC(HWND(std::ptr::null_mut()), screen);
+            REC_OUTLINE.store(hwnd.0 as isize, Ordering::SeqCst);
+            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            let _ = SetWindowPos(
+                hwnd,
+                HWND_TOPMOST,
+                frame.x,
+                frame.y,
+                frame.w,
+                frame.h,
+                SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            );
+        }
+    }
+
+    fn outline_bitmap(frame: &crate::record::Outline) -> Vec<u8> {
+        let w = frame.w as usize;
+        let h = frame.h as usize;
+        let mut buf = vec![0u8; w * h * 4];
+        let pad = crate::record::OUTLINE_RED + crate::record::OUTLINE_DIM;
+        let x0 = (frame.hole_x - pad).max(0);
+        let y0 = (frame.hole_y - pad).max(0);
+        let x1 = (frame.hole_x + frame.hole_w + pad).min(frame.w);
+        let y1 = (frame.hole_y + frame.hole_h + pad).min(frame.h);
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let px = crate::record::outline_pixel(
+                    x,
+                    y,
+                    frame.hole_x,
+                    frame.hole_y,
+                    frame.hole_w,
+                    frame.hole_h,
+                );
+                if px[3] == 0 {
+                    continue;
+                }
+                let i = (y as usize * w + x as usize) * 4;
+                buf[i..i + 4].copy_from_slice(&px);
+            }
+        }
+        buf
+    }
+
+    fn hide_rec_outline() {
+        let h = REC_OUTLINE.swap(0, Ordering::SeqCst);
+        if h != 0 {
+            unsafe {
+                let _ = DestroyWindow(HWND(h as *mut _));
+            }
+        }
+    }
+
+    unsafe extern "system" fn outline_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+        match msg {
+            m if m == WM_NCHITTEST => LRESULT(HTTRANSPARENT as isize),
+            WM_DESTROY => {
+                REC_OUTLINE.store(0, Ordering::SeqCst);
+                LRESULT(0)
+            }
+            _ => DefWindowProcW(hwnd, msg, w, l),
         }
     }
 
