@@ -44,12 +44,12 @@ mod win {
     use windows::core::w;
     use windows::Win32::Foundation::{
         CloseHandle, GetLastError, COLORREF, ERROR_ALREADY_EXISTS, HANDLE, HWND, LPARAM, LRESULT,
-        POINT, RECT, WPARAM,
+        POINT, RECT, SIZE, WPARAM,
     };
     use windows::Win32::Graphics::Gdi::{
         BeginPaint, CreateFontW, CreatePen, CreateRoundRectRgn, CreateSolidBrush, DeleteObject,
         EndPaint, FillRect, InvalidateRect, LineTo, MoveToEx, SelectObject, SetBkMode,
-        DrawTextW, IntersectClipRect, RestoreDC, SaveDC, SetDIBitsToDevice, SetTextColor,
+        DrawTextW, Ellipse, IntersectClipRect, RestoreDC, SaveDC, SetDIBitsToDevice, SetTextColor,
         SetWindowRgn, TextOutW, DT_CALCRECT, DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE,
         DT_VCENTER,
         BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, PS_SOLID, TRANSPARENT,
@@ -66,12 +66,15 @@ mod win {
         PeekMessageW, PostMessageW, PostQuitMessage, RegisterClassW, SetForegroundWindow,
         SetWindowPos, ShowWindow, TrackPopupMenu, TranslateMessage, CS_DROPSHADOW, CS_HREDRAW,
         CS_VREDRAW,
-        HWND_TOPMOST, IDC_ARROW, MF_CHECKED, MF_STRING, MSG, PM_REMOVE, SM_CXSCREEN,
-        SM_CYSCREEN, SWP_NOACTIVATE, SWP_SHOWWINDOW, SW_HIDE, SW_SHOW, TPM_BOTTOMALIGN,
+        HWND_TOPMOST, HTTRANSPARENT, IDC_ARROW, IDC_HAND, MF_CHECKED, MF_STRING, MSG, PM_REMOVE,
+        SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+        SM_YVIRTUALSCREEN, SWP_NOACTIVATE, SWP_SHOWWINDOW, SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE,
+        TPM_BOTTOMALIGN,
         TPM_LEFTALIGN, TPM_RIGHTBUTTON, WM_ACTIVATE, WM_CHAR, WM_CLIPBOARDUPDATE, WM_COMMAND,
         KillTimer, SetTimer, WM_DESTROY, WM_HOTKEY, WM_KEYDOWN, WM_LBUTTONUP, WM_MOUSEWHEEL,
-        WM_PAINT, WM_TIMER, WNDCLASSW,
-        WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+        WM_NCHITTEST, WM_PAINT, WM_TIMER, WNDCLASSW,
+        WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT,
+        WS_POPUP,
     };
 
     const HOT_PALETTE: i32 = 1;
@@ -81,6 +84,7 @@ mod win {
     const HOT_SHOT_LAST: i32 = 5;
     const HOT_CLIP: i32 = 6;
     const HOT_FILES: i32 = 7;
+    const HOT_REC: i32 = 8;
     const TRAY_CB: u32 = 0x8001;
     const WM_WAKE: u32 = 0x8002;
     const WM_SHELL_DONE: u32 = 0x8003;
@@ -91,6 +95,8 @@ mod win {
     const MENU_SET: usize = 1005;
     const MENU_SHOTS: usize = 1006;
     const MENU_AWAKE: usize = 1007;
+    const MENU_REC_STOP: usize = 1008;
+    const MENU_RECS: usize = 1009;
     const VK_ESCAPE: u16 = 0x1B;
     const VK_RETURN: u16 = 0x0D;
     const VK_BACK: u16 = 0x08;
@@ -522,6 +528,13 @@ mod win {
                     HOT_PALETTE => toggle(hwnd),
                     HOT_CLIP => show_blade(hwnd, "/clip"),
                     HOT_FILES => show_blade(hwnd, "/f "),
+                    HOT_REC => {
+                        if crate::record::is_recording() {
+                            crate::record::request_stop();
+                        } else {
+                            begin_recording(hwnd, katana_core::RecAction::Screen);
+                        }
+                    }
                     HOT_SHOT_REGION => run_shot(hwnd, ShotMode::Region),
                     HOT_SHOT_WIN => run_shot(hwnd, ShotMode::Window),
                     HOT_SHOT_SCREEN => run_shot(hwnd, ShotMode::Screen),
@@ -547,6 +560,8 @@ mod win {
                     MENU_SET => crate::editors::open_studio("settings"),
                     MENU_SHOTS => open_shot_folder(),
                     MENU_AWAKE => toggle_awake_ui(hwnd),
+                    MENU_REC_STOP => crate::record::request_stop(),
+                    MENU_RECS => open_rec_folder(),
                     MENU_QUIT => {
                         let _ = DestroyWindow(hwnd);
                     }
@@ -558,11 +573,45 @@ mod win {
                 ingest_clipboard();
                 LRESULT(0)
             }
+            m if m == crate::record::WM_REC_BEGAN => {
+                if let Some(ev) = crate::record::pop_event() {
+                    set_recording_chrome(hwnd, true);
+                    let (x, y, w, h) = ev.bounds;
+                    if w > 1 && h > 1 {
+                        show_rec_outline(x, y, w, h);
+                    }
+                }
+                LRESULT(0)
+            }
+            m if m == crate::record::WM_REC_DONE => {
+                if let Some(ev) = crate::record::pop_event() {
+                    if ev.kind == crate::record::RecEventKind::Saved {
+                        present_saved(hwnd, &ev.path, &ev.detail);
+                    }
+                }
+                LRESULT(0)
+            }
+            m if m == crate::record::WM_REC_FAIL => {
+                set_recording_chrome(hwnd, false);
+                if let Some(ev) = crate::record::pop_event() {
+                    if ev.kind == crate::record::RecEventKind::Failed
+                        && !ev.detail.is_empty()
+                        && ev.detail != "cancelled"
+                    {
+                        tray_info(hwnd, "Recording failed", &ev.detail);
+                    }
+                }
+                LRESULT(0)
+            }
             WM_DESTROY => {
+                crate::record::request_stop();
+                hide_rec_dot();
+                hide_rec_outline();
                 remove_tray(hwnd);
                 let _ = UnregisterHotKey(hwnd, HOT_PALETTE);
                 let _ = UnregisterHotKey(hwnd, HOT_CLIP);
                 let _ = UnregisterHotKey(hwnd, HOT_FILES);
+                let _ = UnregisterHotKey(hwnd, HOT_REC);
                 let h = SINGLETON.swap(0, Ordering::SeqCst);
                 if h != 0 {
                     let _ = CloseHandle(HANDLE(h as *mut _));
@@ -931,6 +980,429 @@ mod win {
         }
     }
 
+    static REC_DOT: AtomicIsize = AtomicIsize::new(0);
+    static REC_ICON: AtomicIsize = AtomicIsize::new(0);
+    static REC_OUTLINE: AtomicIsize = AtomicIsize::new(0);
+
+    fn exclude_from_capture(hwnd: HWND) {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            SetWindowDisplayAffinity, WDA_EXCLUDEFROMCAPTURE,
+        };
+        unsafe {
+            let _ = SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE);
+        }
+    }
+
+    fn set_recording_chrome(hwnd: HWND, on: bool) {
+        if on {
+            show_rec_dot();
+            set_tray_icon(hwnd, recording_icon());
+        } else {
+            hide_rec_dot();
+            hide_rec_outline();
+            set_tray_icon(hwnd, load_app_icon());
+        }
+        refresh_tray_tip(hwnd);
+    }
+
+    fn show_rec_dot() {
+        if REC_DOT.load(Ordering::SeqCst) != 0 {
+            return;
+        }
+        unsafe {
+            let Ok(hinst) = GetModuleHandleW(None) else {
+                return;
+            };
+            let class = w!("KatanaRecDot");
+            let wc = WNDCLASSW {
+                style: CS_HREDRAW | CS_VREDRAW,
+                lpfnWndProc: Some(dot_proc),
+                hInstance: hinst.into(),
+                hCursor: LoadCursorW(None, IDC_HAND).unwrap_or_default(),
+                lpszClassName: class,
+                ..Default::default()
+            };
+            RegisterClassW(&wc);
+            let cx = GetSystemMetrics(SM_CXSCREEN);
+            let Ok(dot) = CreateWindowExW(
+                WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED,
+                class,
+                w!("Recording — click to stop"),
+                WS_POPUP,
+                cx - 36,
+                16,
+                18,
+                18,
+                None,
+                None,
+                hinst,
+                None,
+            ) else {
+                return;
+            };
+            use windows::Win32::UI::WindowsAndMessaging::{
+                SetLayeredWindowAttributes, LWA_COLORKEY,
+            };
+            let _ = SetLayeredWindowAttributes(dot, COLORREF(0x00FF00FF), 0, LWA_COLORKEY);
+            exclude_from_capture(dot);
+            REC_DOT.store(dot.0 as isize, Ordering::SeqCst);
+            let _ = ShowWindow(dot, SW_SHOWNOACTIVATE);
+        }
+    }
+
+    fn hide_rec_dot() {
+        let h = REC_DOT.swap(0, Ordering::SeqCst);
+        if h != 0 {
+            unsafe {
+                let _ = DestroyWindow(HWND(h as *mut _));
+            }
+        }
+    }
+
+    fn show_rec_outline(cap_x: i32, cap_y: i32, cap_w: i32, cap_h: i32) {
+        use windows::Win32::Graphics::Gdi::{
+            CreateCompatibleDC, CreateDIBSection, DeleteDC, GetDC, ReleaseDC, AC_SRC_ALPHA,
+            AC_SRC_OVER, BLENDFUNCTION,
+        };
+            use windows::Win32::UI::WindowsAndMessaging::{UpdateLayeredWindow, ULW_ALPHA};
+        hide_rec_outline();
+        unsafe {
+            let vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+            let vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+            let vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+            let vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+            let frame = crate::record::outline_geometry(cap_x, cap_y, cap_w, cap_h, vx, vy, vw, vh);
+            if frame.w < 4 || frame.h < 4 || frame.w > 16_000 || frame.h > 16_000 {
+                return;
+            }
+            let Ok(hinst) = GetModuleHandleW(None) else {
+                return;
+            };
+            let class = w!("KatanaRecOutline");
+            let wc = WNDCLASSW {
+                style: CS_HREDRAW | CS_VREDRAW,
+                lpfnWndProc: Some(outline_proc),
+                hInstance: hinst.into(),
+                lpszClassName: class,
+                ..Default::default()
+            };
+            RegisterClassW(&wc);
+            let Ok(hwnd) = CreateWindowExW(
+                WS_EX_TRANSPARENT
+                    | WS_EX_LAYERED
+                    | WS_EX_TOOLWINDOW
+                    | WS_EX_NOACTIVATE
+                    | WS_EX_TOPMOST,
+                class,
+                w!("Katana recording"),
+                WS_POPUP,
+                frame.x,
+                frame.y,
+                frame.w,
+                frame.h,
+                None,
+                None,
+                hinst,
+                None,
+            ) else {
+                return;
+            };
+            exclude_from_capture(hwnd);
+            let pixels = outline_bitmap(&frame);
+            let screen = GetDC(HWND(std::ptr::null_mut()));
+            let mem = CreateCompatibleDC(screen);
+            let info = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: frame.w,
+                    biHeight: -frame.h,
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB.0 as u32,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let mut bits = std::ptr::null_mut();
+            let bmp = CreateDIBSection(screen, &info, DIB_RGB_COLORS, &mut bits, None, 0)
+                .unwrap_or_default();
+            if !bits.is_null() && !pixels.is_empty() {
+                std::ptr::copy_nonoverlapping(pixels.as_ptr(), bits.cast(), pixels.len());
+            }
+            let old = SelectObject(mem, bmp);
+            let dst = POINT { x: frame.x, y: frame.y };
+            let size = SIZE { cx: frame.w, cy: frame.h };
+            let src = POINT { x: 0, y: 0 };
+            let blend = BLENDFUNCTION {
+                BlendOp: AC_SRC_OVER as u8,
+                BlendFlags: 0,
+                SourceConstantAlpha: 255,
+                AlphaFormat: AC_SRC_ALPHA as u8,
+            };
+            let _ = UpdateLayeredWindow(
+                hwnd,
+                screen,
+                Some(&dst),
+                Some(&size),
+                mem,
+                Some(&src),
+                COLORREF(0),
+                Some(&blend),
+                ULW_ALPHA,
+            );
+            SelectObject(mem, old);
+            let _ = DeleteObject(bmp);
+            let _ = DeleteDC(mem);
+            ReleaseDC(HWND(std::ptr::null_mut()), screen);
+            REC_OUTLINE.store(hwnd.0 as isize, Ordering::SeqCst);
+            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            let _ = SetWindowPos(
+                hwnd,
+                HWND_TOPMOST,
+                frame.x,
+                frame.y,
+                frame.w,
+                frame.h,
+                SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            );
+        }
+    }
+
+    fn outline_bitmap(frame: &crate::record::Outline) -> Vec<u8> {
+        let w = frame.w as usize;
+        let h = frame.h as usize;
+        let mut buf = vec![0u8; w * h * 4];
+        let pad = crate::record::OUTLINE_RED + crate::record::OUTLINE_DIM;
+        let x0 = (frame.hole_x - pad).max(0);
+        let y0 = (frame.hole_y - pad).max(0);
+        let x1 = (frame.hole_x + frame.hole_w + pad).min(frame.w);
+        let y1 = (frame.hole_y + frame.hole_h + pad).min(frame.h);
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let px = crate::record::outline_pixel(
+                    x,
+                    y,
+                    frame.hole_x,
+                    frame.hole_y,
+                    frame.hole_w,
+                    frame.hole_h,
+                );
+                if px[3] == 0 {
+                    continue;
+                }
+                let i = (y as usize * w + x as usize) * 4;
+                buf[i..i + 4].copy_from_slice(&px);
+            }
+        }
+        buf
+    }
+
+    fn hide_rec_outline() {
+        let h = REC_OUTLINE.swap(0, Ordering::SeqCst);
+        if h != 0 {
+            unsafe {
+                let _ = DestroyWindow(HWND(h as *mut _));
+            }
+        }
+    }
+
+    unsafe extern "system" fn outline_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+        match msg {
+            m if m == WM_NCHITTEST => LRESULT(HTTRANSPARENT as isize),
+            WM_DESTROY => {
+                REC_OUTLINE.store(0, Ordering::SeqCst);
+                LRESULT(0)
+            }
+            _ => DefWindowProcW(hwnd, msg, w, l),
+        }
+    }
+
+    unsafe extern "system" fn dot_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+        match msg {
+            WM_LBUTTONUP => {
+                crate::record::request_stop();
+                LRESULT(0)
+            }
+            WM_PAINT => {
+                let mut ps = PAINTSTRUCT::default();
+                let hdc = BeginPaint(hwnd, &mut ps);
+                let bg = CreateSolidBrush(COLORREF(0x00FF00FF));
+                let area = RECT {
+                    left: 0,
+                    top: 0,
+                    right: 18,
+                    bottom: 18,
+                };
+                FillRect(hdc, &area, bg);
+                let _ = DeleteObject(bg);
+                let pen = CreatePen(PS_SOLID, 2, COLORREF(0x00F4F4F5));
+                let brush = CreateSolidBrush(COLORREF(0x00481DE1));
+                let old_pen = SelectObject(hdc, pen);
+                let old_brush = SelectObject(hdc, brush);
+                let _ = Ellipse(hdc, 1, 1, 17, 17);
+                SelectObject(hdc, old_pen);
+                SelectObject(hdc, old_brush);
+                let _ = DeleteObject(pen);
+                let _ = DeleteObject(brush);
+                let _ = EndPaint(hwnd, &ps);
+                LRESULT(0)
+            }
+            WM_DESTROY => {
+                REC_DOT.store(0, Ordering::SeqCst);
+                LRESULT(0)
+            }
+            _ => DefWindowProcW(hwnd, msg, w, l),
+        }
+    }
+
+    fn recording_icon() -> windows::Win32::UI::WindowsAndMessaging::HICON {
+        use windows::Win32::Graphics::Gdi::{
+            CreateBitmap, CreateDIBSection, GetDC, ReleaseDC, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
+            DIB_RGB_COLORS,
+        };
+        use windows::Win32::UI::WindowsAndMessaging::{CreateIconIndirect, ICONINFO, HICON};
+        let existing = REC_ICON.load(Ordering::SeqCst);
+        if existing != 0 {
+            return HICON(existing as *mut _);
+        }
+        unsafe {
+            let mut pixels = vec![0u8; 16 * 16 * 4];
+            for y in 0..16 {
+                for x in 0..16 {
+                    let dx = x as i32 - 7;
+                    let dy = y as i32 - 7;
+                    if dx * dx + dy * dy <= 30 {
+                        let i = (y * 16 + x) * 4;
+                        pixels[i] = 0x48;
+                        pixels[i + 1] = 0x1D;
+                        pixels[i + 2] = 0xE1;
+                        pixels[i + 3] = 255;
+                    }
+                }
+            }
+            let screen = GetDC(HWND(std::ptr::null_mut()));
+            let info = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: 16,
+                    biHeight: -16,
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB.0 as u32,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let mut bits = std::ptr::null_mut();
+            let color = CreateDIBSection(screen, &info, DIB_RGB_COLORS, &mut bits, None, 0)
+                .unwrap_or_default();
+            if !bits.is_null() {
+                std::ptr::copy_nonoverlapping(pixels.as_ptr(), bits.cast(), pixels.len());
+            }
+            let mask_bits = [0u8; 32];
+            let mask = CreateBitmap(16, 16, 1, 1, Some(mask_bits.as_ptr().cast()));
+            let icon = CreateIconIndirect(&ICONINFO {
+                fIcon: windows::Win32::Foundation::BOOL(1),
+                xHotspot: 0,
+                yHotspot: 0,
+                hbmMask: mask,
+                hbmColor: color,
+            })
+            .unwrap_or_else(|_| load_app_icon());
+            let _ = DeleteObject(color);
+            let _ = DeleteObject(mask);
+            ReleaseDC(HWND(std::ptr::null_mut()), screen);
+            if !icon.0.is_null() {
+                REC_ICON.store(icon.0 as isize, Ordering::SeqCst);
+            }
+            icon
+        }
+    }
+
+    fn set_tray_icon(hwnd: HWND, icon: windows::Win32::UI::WindowsAndMessaging::HICON) {
+        use windows::Win32::UI::Shell::{
+            Shell_NotifyIconW, NIF_ICON, NIM_MODIFY, NOTIFYICONDATAW,
+        };
+        unsafe {
+            let mut nid = NOTIFYICONDATAW::default();
+            nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
+            nid.hWnd = hwnd;
+            nid.uID = 1;
+            nid.uFlags = NIF_ICON;
+            nid.hIcon = icon;
+            let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
+        }
+    }
+
+    fn begin_recording(hwnd: HWND, action: katana_core::RecAction) {
+        use katana_core::RecAction;
+        match action {
+            RecAction::Menu => {}
+            RecAction::Stop => {
+                hide(hwnd);
+                if crate::record::is_recording() {
+                    crate::record::request_stop();
+                } else {
+                    tray_info(hwnd, "Katana", "Not recording");
+                }
+            }
+            RecAction::Screen | RecAction::Region => {
+                hide(hwnd);
+                if crate::record::is_recording() {
+                    tray_info(hwnd, "Katana", "Already recording — stop it first");
+                    return;
+                }
+                let settings = crate::persist::Settings::load(&crate::persist::settings_path());
+                let job = crate::record::RecJob {
+                    fps: settings.rec_fps,
+                    system_audio: settings.rec_audio_system,
+                    mic: settings.rec_audio_mic,
+                    output_dir: crate::persist::rec_dir_from_setting(&settings.rec_output_dir),
+                    pick_region: action == RecAction::Region,
+                };
+                if let Err(e) = crate::record::start(hwnd, job) {
+                    tray_info(hwnd, "Recording failed", &e);
+                }
+            }
+        }
+    }
+
+    fn present_saved(hwnd: HWND, path: &std::path::Path, detail: &str) {
+        set_recording_chrome(hwnd, false);
+        if let Ok(mut g) = super::LAST_SHOT.lock() {
+            *g = Some(path.to_path_buf());
+        }
+        let name = path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+        let line = if detail.is_empty() {
+            format!("{name}\nOpen file  ·  Open folder")
+        } else {
+            format!("{name}\n{detail}\nOpen file  ·  Open folder")
+        };
+        tray_info(hwnd, "Recording saved", &line);
+        let dir = path.parent().unwrap_or(path);
+        if let Ok(mut g) = STATE.lock() {
+            if let Some(ln) = g.as_mut() {
+                ln.offer_recording(path, dir);
+            }
+        }
+        VISIBLE.store(true, Ordering::SeqCst);
+        relayout(hwnd);
+        unsafe {
+            let _ = ShowWindow(hwnd, SW_SHOW);
+            let _ = SetForegroundWindow(hwnd);
+        }
+    }
+
+    fn open_rec_folder() {
+        let settings = crate::persist::Settings::load(&crate::persist::settings_path());
+        let dir = crate::persist::rec_dir_from_setting(&settings.rec_output_dir);
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = crate::exec::open_in_shell(&dir);
+    }
+
     fn tray_info(hwnd: HWND, title: &str, text: &str) {
         use windows::Win32::UI::Shell::{
             Shell_NotifyIconW, NIF_INFO, NIIF_INFO, NIM_MODIFY, NOTIFYICONDATAW,
@@ -960,6 +1432,7 @@ mod win {
         };
         match out {
             Outcome::NeedCapture(mode) => run_shot(hwnd, mode),
+            Outcome::NeedRecord(action) => begin_recording(hwnd, action),
             Outcome::OpenStudio(tab) => {
                 hide(hwnd);
                 crate::editors::open_studio(tab);
@@ -1728,7 +2201,9 @@ mod win {
             nid.hWnd = hwnd;
             nid.uID = 1;
             nid.uFlags = NIF_TIP;
-            let tip = if crate::keepawake::is_on() {
+            let tip = if crate::record::is_recording() {
+                "Katana — recording · click the dot to stop\0"
+            } else if crate::keepawake::is_on() {
                 "Katana — screen awake\0"
             } else {
                 "Katana — Alt+Space · Win+Alt+C clip · Win+Alt+Space files\0"
@@ -1771,10 +2246,14 @@ mod win {
                 w!("Keep screen awake")
             };
             let _ = AppendMenuW(menu, awake_flags, MENU_AWAKE, awake_label);
+            if crate::record::is_recording() {
+                let _ = AppendMenuW(menu, MF_STRING, MENU_REC_STOP, w!("Stop recording"));
+            }
             let _ = AppendMenuW(menu, MF_STRING, MENU_KW, w!("Edit shortcuts…"));
             let _ = AppendMenuW(menu, MF_STRING, MENU_TODO, w!("Edit todos…"));
             let _ = AppendMenuW(menu, MF_STRING, MENU_SET, w!("Settings…"));
             let _ = AppendMenuW(menu, MF_STRING, MENU_SHOTS, w!("Open screenshots folder"));
+            let _ = AppendMenuW(menu, MF_STRING, MENU_RECS, w!("Open recordings folder"));
             let _ = AppendMenuW(menu, MF_STRING, MENU_QUIT, w!("Quit"));
             let mut pt = POINT::default();
             let _ = GetCursorPos(&mut pt);
@@ -1963,6 +2442,12 @@ mod win {
                 &settings.files_hotkey,
                 MOD_WIN | MOD_ALT,
                 0x20,
+            );
+            reg(
+                HOT_REC,
+                &settings.rec_hotkey,
+                MOD_CONTROL | MOD_ALT,
+                b'R' as u32,
             );
             let _ = RegisterHotKey(hwnd, HOT_SHOT_REGION, HOT_KEY_MODIFIERS(0), 0x2C);
             let _ = RegisterHotKey(hwnd, HOT_SHOT_WIN, MOD_ALT, 0x2C);

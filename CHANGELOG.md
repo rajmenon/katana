@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Screen recording (`/rec`)
+- `/rec` lists Record full screen, Record region, and Stop recording. **Ctrl+Alt+R** toggles full-screen recording (`rec_hotkey`)
+- Region mode is a drag-to-select overlay. Capture and H.264 encode run on a worker thread (Desktop Duplication + Media Foundation), so the prompt stays responsive
+- A corner dot and a red tray icon show while recording. Click the dot, use the tray menu, `/rec` stop, or the hotkey to stop
+- A thin red border outlines the recorded region, just outside the captured pixels (on the monitor edge for full screen). The border is click-through, and both it and the dot are excluded from the capture
+- Saves `%USERPROFILE%\Videos\Katana\Katana-YYYYMMDD-HHMMSS.mp4`, then a toast plus Open file and Open folder rows
+- System audio (WASAPI loopback) and the default microphone are off unless `rec_audio_system` / `rec_audio_mic` are set. `rec_fps` defaults to 30 (clamped to 1–60). `rec_output_dir` overrides the folder
+
 ## 0.3.8 — 2026-11-26
 
 ### Files (`/f`)

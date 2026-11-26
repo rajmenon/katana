@@ -9,6 +9,7 @@ mod exec;
 mod keepawake;
 mod launcher;
 mod persist;
+mod record;
 mod search;
 mod splash;
 mod ui;
@@ -91,6 +92,8 @@ mod tests {
             ("/todo", |r| matches!(r, Route::Todo { .. })),
             ("/t", |r| matches!(r, Route::Todo { .. })),
             ("/shot region", |r| matches!(r, Route::Shot { .. })),
+            ("/rec", |r| matches!(r, Route::Rec { .. })),
+            ("/rec stop", |r| matches!(r, Route::Rec { action: katana_core::RecAction::Stop })),
             ("/s", |r| matches!(r, Route::Shot { .. })),
             ("/b", |r| matches!(r, Route::Launch { .. })),
             ("/k", |r| matches!(r, Route::Launch { .. })),

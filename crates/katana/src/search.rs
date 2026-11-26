@@ -236,6 +236,7 @@ impl Engine {
                 1.0,
                 HitKind::Keyword,
             )],
+            Route::Rec { action } => rec_hits(*action),
             Route::Shot { mode } => {
                 let title = match mode {
                     katana_core::ShotMode::Region => "Region  /sr",
@@ -466,11 +467,41 @@ fn bookmark_hit(b: &Bookmark, score: f32) -> Hit {
     )
 }
 
+fn rec_hits(action: katana_core::RecAction) -> Vec<Hit> {
+    let screen = Hit::new(
+        "rec:screen",
+        "Record full screen",
+        "H.264 MP4 · monitor under the cursor",
+        1.0,
+        HitKind::Keyword,
+    );
+    let region = Hit::new(
+        "rec:region",
+        "Record region",
+        "drag to select",
+        1.0,
+        HitKind::Keyword,
+    );
+    let stop_title = if crate::record::is_recording() {
+        "Stop recording  ●"
+    } else {
+        "Stop recording"
+    };
+    let stop = Hit::new("rec:stop", stop_title, "save the MP4", 1.0, HitKind::Keyword);
+    match action {
+        katana_core::RecAction::Menu => vec![screen, region, stop],
+        katana_core::RecAction::Screen => vec![screen],
+        katana_core::RecAction::Region => vec![region],
+        katana_core::RecAction::Stop => vec![stop],
+    }
+}
+
 fn command_hits() -> Vec<Hit> {
     [
         ("/todo", Some('t'), "Tasks", HitKind::Todo),
         ("/clip", Some('c'), "Clipboard history", HitKind::Clip),
         ("/shot", Some('s'), "Region, window, or page", HitKind::Shot),
+        ("/rec", Some('r'), "Screen or region video", HitKind::Keyword),
         ("/awake", None, "Keep screen awake", HitKind::Keyword),
         ("/settings", None, "Shortcuts, todos, hotkeys", HitKind::Keyword),
     ]
@@ -509,7 +540,7 @@ fn command_hits() -> Vec<Hit> {
 /// so the kind (`todo`, `keyword`, …) is not repeated in front of the description.
 pub fn row_detail(h: &Hit) -> String {
     let sub = h.subtitle.trim();
-    if h.id.starts_with("cmd:") {
+    if h.id.starts_with("cmd:") || h.id.starts_with("rec:") || h.id.starts_with("reco:") {
         return sub.to_string();
     }
     let kind = format!("{:?}", h.kind).to_ascii_lowercase();
@@ -783,6 +814,7 @@ pub fn blade_footer(q: &str, composing: bool) -> Option<&'static str> {
         Some("shot" | "ss" | "s" | "sr" | "sw" | "sf") => {
             Some("↵ capture    /sr region    /sw window    /sf browser    esc back")
         }
+        Some("rec" | "record") => Some("↵ record or stop    esc back"),
         Some("f" | "file" | "files") => {
             Some("↵ open    ctrl+c copy path    click headers to sort    esc back")
         }
