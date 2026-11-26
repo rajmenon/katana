@@ -29,6 +29,15 @@ pub enum ShotMode {
     Delay { secs: u32 },
 }
 
+/// What `/rec` should do. `Menu` lists the three actions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecAction {
+    Menu,
+    Screen,
+    Region,
+    Stop,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Route {
     Recents,
@@ -43,6 +52,7 @@ pub enum Route {
     Clip { query: String },
     Todo { rest: String },
     Shot { mode: ShotMode },
+    Rec { action: RecAction },
     Shortcuts { query: String },
     Settings,
     EditKeywords,
@@ -90,6 +100,34 @@ pub fn parse_shot_rest(rest: &str) -> ShotMode {
         }
     }
     ShotMode::Region
+}
+
+/// Parse `/rec` remainder. Empty or unknown text opens the menu.
+pub fn parse_rec_rest(rest: &str) -> RecAction {
+    let r = rest.trim();
+    if r.is_empty() {
+        return RecAction::Menu;
+    }
+    if r.eq_ignore_ascii_case("screen")
+        || r.eq_ignore_ascii_case("full")
+        || r.eq_ignore_ascii_case("fullscreen")
+        || r.eq_ignore_ascii_case("s")
+    {
+        return RecAction::Screen;
+    }
+    if r.eq_ignore_ascii_case("region")
+        || r.eq_ignore_ascii_case("r")
+        || r.eq_ignore_ascii_case("area")
+    {
+        return RecAction::Region;
+    }
+    if r.eq_ignore_ascii_case("stop")
+        || r.eq_ignore_ascii_case("end")
+        || r.eq_ignore_ascii_case("off")
+    {
+        return RecAction::Stop;
+    }
+    RecAction::Menu
 }
 
 fn looks_like_url(s: &str) -> bool {
@@ -178,6 +216,11 @@ pub fn route(q: &Query, known_keyword: bool) -> Route {
             "sf" => {
                 return Route::Shot {
                     mode: ShotMode::Browser,
+                };
+            }
+            "rec" | "record" => {
+                return Route::Rec {
+                    action: parse_rec_rest(&q.rest),
                 };
             }
             "f" | "file" | "files" => {
@@ -423,5 +466,43 @@ mod tests {
         assert_eq!(parse_shot_rest("browser"), ShotMode::Browser);
         assert_eq!(parse_shot_rest("last"), ShotMode::Last);
         assert_eq!(parse_shot_rest("delay"), ShotMode::Delay { secs: 3 });
+    }
+
+    #[test]
+    fn parse_rec_actions() {
+        assert_eq!(parse_rec_rest(""), RecAction::Menu);
+        assert_eq!(parse_rec_rest("nope"), RecAction::Menu);
+        assert_eq!(parse_rec_rest("screen"), RecAction::Screen);
+        assert_eq!(parse_rec_rest("FULL"), RecAction::Screen);
+        assert_eq!(parse_rec_rest("s"), RecAction::Screen);
+        assert_eq!(parse_rec_rest("region"), RecAction::Region);
+        assert_eq!(parse_rec_rest("r"), RecAction::Region);
+        assert_eq!(parse_rec_rest("stop"), RecAction::Stop);
+        assert_eq!(parse_rec_rest("end"), RecAction::Stop);
+        assert_eq!(
+            r("/rec", false),
+            Route::Rec {
+                action: RecAction::Menu
+            }
+        );
+        assert_eq!(
+            r("/rec screen", false),
+            Route::Rec {
+                action: RecAction::Screen
+            }
+        );
+        assert_eq!(
+            r("/record region", false),
+            Route::Rec {
+                action: RecAction::Region
+            }
+        );
+        assert_eq!(
+            r("/rec stop", false),
+            Route::Rec {
+                action: RecAction::Stop
+            }
+        );
+        assert!(matches!(r("rec screen", false), Route::Unified { .. }));
     }
 }

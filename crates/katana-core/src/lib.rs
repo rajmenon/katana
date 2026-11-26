@@ -13,7 +13,7 @@ pub use keyword::{
     keyword_complete_stem, keyword_completions, paste_url_arg, resolve_keyword, Keyword,
     KeywordComplete, ResolvedAction,
 };
-pub use query::{route, parse_shot_rest, Query, Route, ShotMode};
+pub use query::{parse_rec_rest, parse_shot_rest, route, Query, RecAction, Route, ShotMode};
 pub use rank::{fuzzy_score, merge_hits, score_hit, FuzzyEngine, Hit, HitKind, PreparedQuery};
 pub use recents::{
     is_recent_hit, prepend_recents, replay_text, strip_recent_label, RecentItem, Recents,

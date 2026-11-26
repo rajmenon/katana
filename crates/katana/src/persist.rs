@@ -145,6 +145,21 @@ pub struct Settings {
     /// Global hotkey that opens `/f`. Default Win+Alt+Space.
     #[serde(default = "default_files_hotkey")]
     pub files_hotkey: String,
+    /// Global hotkey that toggles screen recording. Default Ctrl+Alt+R.
+    #[serde(default = "default_rec_hotkey")]
+    pub rec_hotkey: String,
+    /// Capture frame rate. Clamped to 1..=60; 0 or a missing key is 30.
+    #[serde(default = "default_rec_fps")]
+    pub rec_fps: u32,
+    /// WASAPI loopback of the default speakers. Off unless set.
+    #[serde(default)]
+    pub rec_audio_system: bool,
+    /// Default microphone. Off unless set.
+    #[serde(default)]
+    pub rec_audio_mic: bool,
+    /// Folder for MP4s. Empty uses `%USERPROFILE%\Videos\Katana`.
+    #[serde(default)]
+    pub rec_output_dir: String,
     #[serde(default)]
     pub autostart: bool,
     #[serde(default = "default_true")]
@@ -215,6 +230,23 @@ fn default_files_hotkey() -> String {
     "win+alt+space".into()
 }
 
+fn default_rec_hotkey() -> String {
+    "ctrl+alt+r".into()
+}
+
+fn default_rec_fps() -> u32 {
+    30
+}
+
+/// `0` means "use the default". Anything else is clamped to 1..=60.
+pub fn clamp_rec_fps(n: u32) -> u32 {
+    if n == 0 {
+        default_rec_fps()
+    } else {
+        n.clamp(1, 60)
+    }
+}
+
 pub const HK_ALT: u32 = 0x0001;
 pub const HK_CTRL: u32 = 0x0002;
 pub const HK_SHIFT: u32 = 0x0004;
@@ -272,6 +304,11 @@ impl Default for Settings {
             hotkey: default_hotkey(),
             clip_hotkey: default_clip_hotkey(),
             files_hotkey: default_files_hotkey(),
+            rec_hotkey: default_rec_hotkey(),
+            rec_fps: default_rec_fps(),
+            rec_audio_system: false,
+            rec_audio_mic: false,
+            rec_output_dir: String::new(),
             autostart: false,
             save_shots: true,
             crawl_folders: Vec::new(),
@@ -302,6 +339,86 @@ pub fn next_shot_path() -> PathBuf {
     dir.join(format!("Katana-{secs}.png"))
 }
 
+/// Local calendar fields used in `Katana-YYYYMMDD-HHMMSS.mp4`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecStamp {
+    pub year: i32,
+    pub month: u32,
+    pub day: u32,
+    pub hour: u32,
+    pub minute: u32,
+    pub second: u32,
+}
+
+pub fn rec_filename(stamp: RecStamp) -> String {
+    format!(
+        "Katana-{:04}{:02}{:02}-{:02}{:02}{:02}.mp4",
+        stamp.year, stamp.month, stamp.day, stamp.hour, stamp.minute, stamp.second
+    )
+}
+
+/// Empty `configured` is `%USERPROFILE%\Videos\Katana`.
+pub fn rec_dir_from_setting(configured: &str) -> PathBuf {
+    let t = configured.trim();
+    if !t.is_empty() {
+        return PathBuf::from(t);
+    }
+    if let Ok(home) = std::env::var("USERPROFILE") {
+        if !home.is_empty() {
+            return PathBuf::from(home).join("Videos").join("Katana");
+        }
+    }
+    data_dir().join("videos")
+}
+
+/// `dir/Katana-YYYYMMDD-HHMMSS.mp4`, or `…-2.mp4` when that name is taken.
+pub fn rec_output_path(dir: &Path, stamp: RecStamp) -> PathBuf {
+    let base = rec_filename(stamp);
+    let first = dir.join(&base);
+    if !first.exists() {
+        return first;
+    }
+    let stem = base.trim_end_matches(".mp4");
+    for n in 2..1000 {
+        let path = dir.join(format!("{stem}-{n}.mp4"));
+        if !path.exists() {
+            return path;
+        }
+    }
+    dir.join(format!("{stem}-{}.mp4", std::process::id()))
+}
+
+#[cfg(windows)]
+pub fn local_rec_stamp() -> RecStamp {
+    #[repr(C)]
+    struct SystemTime {
+        year: u16,
+        month: u16,
+        day_of_week: u16,
+        day: u16,
+        hour: u16,
+        minute: u16,
+        second: u16,
+        millis: u16,
+    }
+    extern "system" {
+        fn GetLocalTime(out: *mut SystemTime);
+    }
+    let mut t = std::mem::MaybeUninit::<SystemTime>::uninit();
+    unsafe {
+        GetLocalTime(t.as_mut_ptr());
+        let t = t.assume_init();
+        RecStamp {
+            year: t.year as i32,
+            month: t.month as u32,
+            day: t.day as u32,
+            hour: t.hour as u32,
+            minute: t.minute as u32,
+            second: t.second as u32,
+        }
+    }
+}
+
 impl Settings {
     pub fn load(path: &Path) -> Self {
         let Ok(raw) = fs::read_to_string(path) else {
@@ -316,6 +433,7 @@ impl Settings {
             .map(|d| d.trim().to_string())
             .filter(|d| !d.is_empty())
             .collect();
+        s.rec_fps = clamp_rec_fps(s.rec_fps);
         s
     }
 
@@ -571,6 +689,11 @@ mod tests {
             hotkey: "alt+space".into(),
             clip_hotkey: "win+alt+c".into(),
             files_hotkey: "win+alt+space".into(),
+            rec_hotkey: "ctrl+alt+r".into(),
+            rec_fps: 30,
+            rec_audio_system: false,
+            rec_audio_mic: false,
+            rec_output_dir: String::new(),
             autostart: true,
             save_shots: true,
             crawl_folders: vec![r"C:\src".into()],
@@ -593,6 +716,11 @@ mod tests {
         assert_eq!(Settings::load(&p).hotkey, "alt+space");
         assert_eq!(Settings::load(&p).clip_hotkey, "win+alt+c");
         assert_eq!(Settings::load(&p).files_hotkey, "win+alt+space");
+        assert_eq!(Settings::load(&p).rec_hotkey, "ctrl+alt+r");
+        assert_eq!(Settings::load(&p).rec_fps, 30);
+        assert!(!Settings::load(&p).rec_audio_system);
+        assert!(!Settings::load(&p).rec_audio_mic);
+        assert!(Settings::load(&p).rec_output_dir.is_empty());
         assert!(Settings::default().save_shots);
         assert_eq!(Settings::load(&p).clip_history_limit, 100);
         assert!(Settings::load(&p).last_keyword.is_empty());
@@ -682,7 +810,78 @@ mod tests {
         assert_eq!(vk3, 0x20);
         assert_eq!(m3 & HK_ALT, HK_ALT);
         assert_eq!(m3 & HK_WIN, 0);
+        let (m4, vk4) = parse_hotkey("ctrl+alt+r").unwrap();
+        assert_eq!(vk4, b'R' as u32);
+        assert_eq!(m4 & HK_CTRL, HK_CTRL);
+        assert_eq!(m4 & HK_ALT, HK_ALT);
+        assert_eq!(m4 & HK_SHIFT, 0);
+        assert_eq!(m4 & HK_WIN, 0);
         assert!(parse_hotkey("nope").is_none());
+    }
+
+    #[test]
+    fn rec_settings_parse_and_clamp_fps() {
+        let dir = tmp("rec-cfg");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        fs::write(
+            &path,
+            r#"
+hotkey = "alt+space"
+rec_hotkey = "ctrl+shift+r"
+rec_fps = 24
+rec_audio_system = true
+rec_audio_mic = false
+rec_output_dir = "D:\\Captures"
+"#,
+        )
+        .unwrap();
+        let s = Settings::load(&path);
+        assert_eq!(s.rec_hotkey, "ctrl+shift+r");
+        assert_eq!(s.rec_fps, 24);
+        assert!(s.rec_audio_system);
+        assert!(!s.rec_audio_mic);
+        assert_eq!(s.rec_output_dir, r"D:\Captures");
+        fs::write(&path, "rec_fps = 0\n").unwrap();
+        assert_eq!(Settings::load(&path).rec_fps, 30);
+        fs::write(&path, "rec_fps = 120\n").unwrap();
+        assert_eq!(Settings::load(&path).rec_fps, 60);
+        assert_eq!(clamp_rec_fps(1), 1);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn rec_filename_and_collision() {
+        let stamp = RecStamp {
+            year: 2026,
+            month: 11,
+            day: 26,
+            hour: 1,
+            minute: 45,
+            second: 7,
+        };
+        assert_eq!(rec_filename(stamp), "Katana-20261126-014507.mp4");
+        let dir = tmp("rec-name");
+        fs::create_dir_all(&dir).unwrap();
+        let first = rec_output_path(&dir, stamp);
+        assert_eq!(first.file_name().unwrap(), "Katana-20261126-014507.mp4");
+        fs::write(&first, b"x").unwrap();
+        let second = rec_output_path(&dir, stamp);
+        assert_eq!(
+            second.file_name().unwrap(),
+            "Katana-20261126-014507-2.mp4"
+        );
+        assert_eq!(
+            rec_dir_from_setting(r"D:\Captures"),
+            PathBuf::from(r"D:\Captures")
+        );
+        let fallback = rec_dir_from_setting("  ");
+        let shown = fallback.to_string_lossy();
+        assert!(
+            shown.contains("Katana") || shown.ends_with("videos"),
+            "{shown}"
+        );
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

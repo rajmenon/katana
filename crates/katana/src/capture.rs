@@ -637,6 +637,14 @@ pub fn dim_bgra(src: &[u8], num: u16, den: u16) -> Vec<u8> {
     out
 }
 
+/// Drag a rectangle on a dimmed copy of the screen. Runs its own message loop,
+/// so call it off the UI thread when the rest of Katana must stay responsive.
+#[cfg(windows)]
+pub fn select_region() -> Result<PhysRect, String> {
+    let full = capture_virtual_screen()?;
+    pick_region(&full)
+}
+
 #[cfg(windows)]
 fn select_and_capture_region() -> Result<Frame, String> {
     // Capture first so the picker overlay is not in the shot.

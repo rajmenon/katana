@@ -3,7 +3,7 @@
 use katana_clip::ClipStore;
 use katana_core::{
     find_keyword, is_recent_hit, keyword_complete_stem, keyword_completions, parse_shot_rest,
-    resolve_keyword, Hit, HitKind, ResolvedAction, Route, ShotMode,
+    resolve_keyword, Hit, HitKind, RecAction, ResolvedAction, Route, ShotMode,
 };
 use katana_index::NameIndex;
 use katana_shot::{dib_from_bgra, png_from_bgra, PhysRect};
@@ -21,6 +21,7 @@ pub enum Outcome {
     Shot { width: u32, height: u32, png_len: usize, dib_len: usize },
     Listed(Vec<Hit>),
     NeedCapture(ShotMode),
+    NeedRecord(RecAction),
     OpenStudio(&'static str),
     /// Clipboard already set; UI restores the previous window and sends Ctrl+V.
     Paste,
@@ -521,7 +522,12 @@ impl Launcher {
 
     fn selected_candidate(&self) -> Option<Hit> {
         let h = self.hits.get(self.selected)?;
-        if h.id.starts_with("cmd:") || h.id == "studio" || h.id == "clip:clear" {
+        if h.id.starts_with("cmd:")
+            || h.id.starts_with("rec:")
+            || h.id.starts_with("reco:")
+            || h.id == "studio"
+            || h.id == "clip:clear"
+        {
             return None;
         }
         match h.kind {
@@ -601,6 +607,9 @@ impl Launcher {
 
     /// Footer hint under the rows; home gets one once there is history.
     pub fn footer(&self) -> Option<String> {
+        if self.hits.first().is_some_and(|h| h.id.starts_with("reco:")) {
+            return Some("↵ open    ↑↓ select    esc hide".to_string());
+        }
         if !self.composing() && crate::search::is_home_query(&self.query) {
             return self
                 .hits
@@ -667,6 +676,10 @@ impl Launcher {
             }
             Route::Todo { rest } => self.execute_todo(&rest),
             Route::Shot { mode } => Ok(Outcome::NeedCapture(mode)),
+            Route::Rec { action } => match action {
+                RecAction::Menu => self.execute_selected_hit(),
+                other => Ok(Outcome::NeedRecord(other)),
+            },
             Route::Settings => Ok(Outcome::OpenStudio("settings")),
             Route::EditKeywords => Ok(Outcome::OpenStudio("shortcuts")),
             Route::EditTodos => Ok(Outcome::OpenStudio("todos")),
@@ -690,6 +703,21 @@ impl Launcher {
             .get(self.selected)
             .cloned()
             .ok_or_else(|| "nothing selected".to_string())?;
+        if let Some(which) = hit.id.strip_prefix("rec:") {
+            let action = match which {
+                "screen" => RecAction::Screen,
+                "region" => RecAction::Region,
+                "stop" => RecAction::Stop,
+                _ => return Err("unknown recording action".into()),
+            };
+            return Ok(Outcome::NeedRecord(action));
+        }
+        if let Some(path) = hit.id.strip_prefix("reco:") {
+            if !self.dry_run {
+                crate::exec::open_in_shell(std::path::Path::new(path))?;
+            }
+            return Ok(Outcome::Ran(format!("open {path}")));
+        }
         if let Some(cmd) = hit.id.strip_prefix("cmd:") {
             if hit.kind == katana_core::HitKind::Shot {
                 return Ok(Outcome::NeedCapture(ShotMode::Region));
@@ -923,6 +951,32 @@ impl Launcher {
 
     pub fn go_home(&mut self) {
         self.set_query("");
+    }
+
+    /// After a recording is saved: two rows, Open file and Open folder.
+    pub fn offer_recording(&mut self, file: &std::path::Path, dir: &std::path::Path) {
+        self.todo_input = None;
+        self.tab_active = false;
+        self.query.clear();
+        self.caret = 0;
+        self.file_scroll = 0;
+        self.hits = vec![
+            Hit::new(
+                format!("reco:{}", file.display()),
+                "Open file",
+                file.display().to_string(),
+                1.0,
+                HitKind::File,
+            ),
+            Hit::new(
+                format!("reco:{}", dir.display()),
+                "Open folder",
+                dir.display().to_string(),
+                1.0,
+                HitKind::File,
+            ),
+        ];
+        self.selected = 0;
     }
 
     /// Step toward home. `true` = caller should hide the overlay.
@@ -1819,6 +1873,49 @@ mod tests {
     }
 
     #[test]
+    fn rec_menu_starts_and_stops() {
+        let mut l = launch();
+        l.set_query("/rec");
+        let titles: Vec<_> = l.hits.iter().map(|h| h.title.as_str()).collect();
+        assert_eq!(
+            titles,
+            ["Record full screen", "Record region", "Stop recording"]
+        );
+        assert_eq!(
+            crate::search::row_detail(&l.hits[0]),
+            "H.264 MP4 · monitor under the cursor"
+        );
+        match l.execute_current().unwrap() {
+            Outcome::NeedRecord(RecAction::Screen) => {}
+            other => panic!("{other:?}"),
+        }
+        l.set_query("/rec");
+        l.selected = 1;
+        match l.execute_current().unwrap() {
+            Outcome::NeedRecord(RecAction::Region) => {}
+            other => panic!("{other:?}"),
+        }
+        match l.execute_query("/rec stop").unwrap() {
+            Outcome::NeedRecord(RecAction::Stop) => {}
+            other => panic!("{other:?}"),
+        }
+        match l.execute_query("/record region").unwrap() {
+            Outcome::NeedRecord(RecAction::Region) => {}
+            other => panic!("{other:?}"),
+        }
+        l.offer_recording(
+            std::path::Path::new(r"C:\Users\A\Videos\Katana\Katana-20261126-014507.mp4"),
+            std::path::Path::new(r"C:\Users\A\Videos\Katana"),
+        );
+        assert_eq!(l.hits[0].title, "Open file");
+        assert_eq!(l.hits[1].title, "Open folder");
+        assert!(l.footer().unwrap().contains("open"));
+        match l.execute_current().unwrap() {
+            Outcome::Ran(s) => assert!(s.contains("Katana-20261126-014507.mp4"), "{s}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
     fn shot_short_commands_need_capture() {
         let mut l = launch();
         match l.execute_query("/sr").unwrap() {
