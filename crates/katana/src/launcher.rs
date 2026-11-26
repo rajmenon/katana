@@ -24,8 +24,10 @@ pub enum Outcome {
     OpenStudio(&'static str),
     /// Clipboard already set; UI restores the previous window and sends Ctrl+V.
     Paste,
-    /// Shell command finished with a non-zero exit (overlay should blink).
-    CmdFailed { exit: i32, cmdline: String },
+    /// `>` / Run command. The UI spawns it off the message loop.
+    PendingShell { cmdline: String, admin: bool },
+    /// The command could not be started. The overlay stays up and shows `message`.
+    CmdFailed { message: String },
 }
 
 #[derive(Debug, Clone)]
@@ -624,7 +626,18 @@ impl Launcher {
                 Ok(Outcome::Copied(s))
             }
             Route::Shell { cmdline, elevate } => {
-                self.run_action(&ResolvedAction::Shell { cmdline, admin: elevate })
+                if self.dry_run {
+                    self.run_action(&ResolvedAction::Shell {
+                        cmdline,
+                        admin: elevate,
+                    })
+                } else {
+                    // Spawn after the UI lock is dropped, on `katana-spawn`.
+                    Ok(Outcome::PendingShell {
+                        cmdline,
+                        admin: elevate,
+                    })
+                }
             }
             Route::Url { url } => self.run_action(&ResolvedAction::OpenUrl(url)),
             Route::Keyword { .. } if self.selected > 0 => self.execute_selected_hit(),
@@ -730,10 +743,19 @@ impl Launcher {
                 Ok(Outcome::Listed(self.hits.clone()))
             }
             katana_core::HitKind::Calc => Ok(Outcome::Copied(hit.title)),
-            katana_core::HitKind::Shell => self.run_action(&ResolvedAction::Shell {
-                cmdline: hit.title,
-                admin: false,
-            }),
+            katana_core::HitKind::Shell => {
+                if self.dry_run {
+                    self.run_action(&ResolvedAction::Shell {
+                        cmdline: hit.title,
+                        admin: false,
+                    })
+                } else {
+                    Ok(Outcome::PendingShell {
+                        cmdline: hit.title,
+                        admin: false,
+                    })
+                }
+            }
             katana_core::HitKind::Shot => Ok(Outcome::NeedCapture(ShotMode::Region)),
         }
     }
@@ -1120,22 +1142,71 @@ impl Launcher {
         Some((tw, th, scaled))
     }
 
-    fn run_action(&self, action: &ResolvedAction) -> Result<Outcome, String> {
+    fn run_action(&mut self, action: &ResolvedAction) -> Result<Outcome, String> {
         if self.dry_run {
             return Ok(Outcome::Ran(format!("{action:?}")));
         }
         match action {
             ResolvedAction::Shell { cmdline, admin } => {
-                match crate::exec::run_shell(cmdline, *admin) {
-                    Ok(()) => Ok(Outcome::Ran(format!("shell {cmdline}"))),
-                    Err(exit) => Ok(Outcome::CmdFailed {
-                        exit,
-                        cmdline: cmdline.clone(),
-                    }),
-                }
+                let result = crate::exec::spawn_shell(cmdline, *admin);
+                Ok(self.settle_shell(cmdline, result, false))
             }
             other => Ok(Outcome::Ran(perform(other)?)),
         }
+    }
+
+    /// Apply a detached spawn. `from_async` is the `>` path, which returns here
+    /// after the message loop has already continued.
+    pub(crate) fn settle_shell(
+        &mut self,
+        cmdline: &str,
+        result: Result<(), String>,
+        from_async: bool,
+    ) -> Outcome {
+        let still_here = !from_async || self.prompt_still_runs(cmdline);
+        match result {
+            Ok(()) => {
+                if matches!(
+                    self.engine.route_str(&self.query),
+                    Route::Shell { cmdline: current, .. } if current == cmdline
+                ) {
+                    if let Some(h) = self.recent_candidate() {
+                        self.remember(&h);
+                    }
+                }
+                if still_here {
+                    Outcome::Ran(format!("shell {cmdline}"))
+                } else {
+                    Outcome::Listed(self.hits.clone())
+                }
+            }
+            Err(message) => {
+                if still_here {
+                    self.note_shell_error(&message);
+                }
+                Outcome::CmdFailed { message }
+            }
+        }
+    }
+
+    fn prompt_still_runs(&self, cmdline: &str) -> bool {
+        match self.engine.route_str(&self.query) {
+            Route::Shell { cmdline: current, .. } => current == cmdline,
+            _ => self.hits.get(self.selected).is_some_and(|h| {
+                h.kind == HitKind::Shell && h.title == cmdline
+            }),
+        }
+    }
+
+    fn note_shell_error(&mut self, message: &str) {
+        self.hits = vec![Hit::new(
+            "err:shell",
+            "Couldn't run command",
+            message.to_string(),
+            1.0,
+            HitKind::Shell,
+        )];
+        self.selected = 0;
     }
 
     pub fn ingest_clipboard_text(&mut self, text: &str) -> Result<Option<i64>, String> {
@@ -2110,5 +2181,103 @@ mod tests {
         assert_eq!(opts.skip_dirs, vec!["Keep-Out".to_string()]);
         assert!(!opts.index_dotfiles);
         assert_eq!(opts.max_depth, 7);
+    }
+
+    fn launch_live() -> Launcher {
+        let dir = tmp("live");
+        std::fs::create_dir_all(&dir).unwrap();
+        Launcher::open(
+            &dir.join("t.db"),
+            &dir.join("c.db"),
+            katana_index::NameIndex::new(),
+            false,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn greater_than_powershell_does_not_run_on_enter() {
+        let mut l = launch_live();
+        l.set_query(">powershell");
+        assert_eq!(l.hits[0].subtitle, "Run command");
+        let started = std::time::Instant::now();
+        match l.execute_current().unwrap() {
+            Outcome::PendingShell { cmdline, admin } => {
+                assert_eq!(cmdline, "powershell");
+                assert!(!admin);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(200),
+            "Enter blocked: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn run_command_miss_shows_an_error_row_quickly() {
+        let mut l = launch_live();
+        let started = std::time::Instant::now();
+        match l.execute_query("> katana-missing-cmd-zzzy").unwrap() {
+            Outcome::PendingShell { cmdline, admin } => {
+                assert!(!admin);
+                let result = crate::exec::spawn_shell(&cmdline, admin);
+                assert!(
+                    started.elapsed() < std::time::Duration::from_secs(2),
+                    "{:?}",
+                    started.elapsed()
+                );
+                match l.settle_shell(&cmdline, result, true) {
+                    Outcome::CmdFailed { message } => {
+                        assert!(message.contains("not found"), "{message}");
+                        assert!(message.contains("katana-missing-cmd-zzzy"), "{message}");
+                    }
+                    other => panic!("{other:?}"),
+                }
+                assert_eq!(l.hits[0].title, "Couldn't run command");
+                assert!(
+                    l.hits[0].subtitle.contains("not found"),
+                    "{}",
+                    l.hits[0].subtitle
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_command_spawn_returns_before_the_child_exits() {
+        let dir = tmp("sleep");
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("katana-launch-sleep");
+        std::fs::write(&script, "#!/bin/sh\nsleep 8\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let mut l = launch_live();
+        let q = format!(">{}", script.display());
+        let started = std::time::Instant::now();
+        match l.execute_query(&q).unwrap() {
+            Outcome::PendingShell { cmdline, admin } => {
+                let result = crate::exec::spawn_shell(&cmdline, admin);
+                assert!(
+                    started.elapsed() < std::time::Duration::from_secs(2),
+                    "spawn blocked: {:?}",
+                    started.elapsed()
+                );
+                assert!(result.is_ok(), "{result:?}");
+                assert!(matches!(
+                    l.settle_shell(&cmdline, result, true),
+                    Outcome::Ran(_)
+                ));
+            }
+            other => panic!("{other:?}"),
+        }
+        let _ = std::process::Command::new("pkill")
+            .args(["-f", "katana-launch-sleep"])
+            .status();
     }
 }
