@@ -294,8 +294,11 @@ impl NameIndex {
                 let stem = launch_stem(&nl);
                 for (i, e) in self.entries.iter().enumerate() {
                     let name = self.name_at(e);
-                    let score = name_match_score(name, nl.as_bytes())
-                        .or_else(|| stem.and_then(|s| name_match_score(name, s)));
+                    // A stem hit (`kestrel` for `kestrel.exe`) stays below an exact
+                    // filename so the binary outranks the folder and `kestrel.css`.
+                    let score = name_match_score(name, nl.as_bytes()).or_else(|| {
+                        stem.and_then(|s| name_match_score(name, s).map(|sc| sc * 0.97))
+                    });
                     if let Some(score) = score {
                         push(&mut heap, score, i as u32);
                     }
@@ -566,6 +569,15 @@ impl NameIndex {
 
 /// Build the live index: MFT+path walk, else user-folder walk.
 pub fn build_live_index(user_roots: &[PathBuf]) -> NameIndex {
+    build_live_index_with(user_roots, &IndexOptions::default())
+}
+
+/// Same as [`build_live_index`], using `opts` for the folder walk.
+///
+/// A successful NTFS MFT read still returns the volume (capped at two million
+/// records) and does not apply `opts`. Without that privilege the walk is the
+/// index, and it follows `opts` exactly.
+pub fn build_live_index_with(user_roots: &[PathBuf], opts: &IndexOptions) -> NameIndex {
     let mut idx = {
         #[cfg(windows)]
         {
@@ -573,15 +585,15 @@ pub fn build_live_index(user_roots: &[PathBuf]) -> NameIndex {
                 if let Ok(idx) = try_mft_volume(letter) {
                     idx
                 } else {
-                    walk_roots(user_roots)
+                    walk_roots_with(user_roots, opts)
                 }
             } else {
-                walk_roots(user_roots)
+                walk_roots_with(user_roots, opts)
             }
         }
         #[cfg(not(windows))]
         {
-            walk_roots(user_roots)
+            walk_roots_with(user_roots, opts)
         }
     };
     inject_folder_roots(&mut idx, user_roots);
@@ -607,14 +619,82 @@ fn boot_drive_letter() -> Option<char> {
         .map(|c| c.to_ascii_uppercase())
 }
 
+/// How deep [`walk_roots`] goes under each root. Overridable via settings.
+pub const DEFAULT_INDEX_MAX_DEPTH: u8 = 24;
+
+/// What the folder walk indexes. File extensions are never a filter.
+///
+/// `skip_dirs` is matched case-insensitively against directory names. A name
+/// on that list is recorded, but the walk does not enter it. `target` is not
+/// a default, so `target/release/*.exe` under an indexed root is searchable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexOptions {
+    pub skip_dirs: Vec<String>,
+    pub index_dotfiles: bool,
+    pub max_depth: u8,
+}
+
+impl Default for IndexOptions {
+    fn default() -> Self {
+        Self {
+            skip_dirs: default_index_skip_dirs(),
+            index_dotfiles: true,
+            max_depth: DEFAULT_INDEX_MAX_DEPTH,
+        }
+    }
+}
+
+/// Documented default exclusions for `/f`. Not `target`, `dist`, or `*.exe`.
+pub fn default_index_skip_dirs() -> Vec<String> {
+    [
+        "node_modules",
+        ".git",
+        "AppData",
+        "Windows",
+        "$Recycle.Bin",
+        "System Volume Information",
+        "anaconda3",
+        ".cargo",
+        ".rustup",
+        "__pycache__",
+        ".venv",
+        "venv",
+        ".mypy_cache",
+        ".next",
+        ".cache",
+        "coverage",
+        ".tox",
+        "site-packages",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
+/// True when `name` is a directory the file walk should not enter.
+pub fn dir_excluded(name: &str, skip_dirs: &[String]) -> bool {
+    let name = name.trim();
+    if name.is_empty() || name == "." || name == ".." {
+        return false;
+    }
+    skip_dirs.iter().any(|s| {
+        let s = s.trim();
+        !s.is_empty() && s.eq_ignore_ascii_case(name)
+    })
+}
+
 /// Drop a root whose files are already reached by walking an ancestor.
 /// Home + Documents would otherwise index every document twice.
 pub fn prepare_roots(roots: &[PathBuf]) -> Vec<PathBuf> {
+    prepare_roots_with(roots, &IndexOptions::default())
+}
+
+pub fn prepare_roots_with(roots: &[PathBuf], opts: &IndexOptions) -> Vec<PathBuf> {
     let mut v: Vec<PathBuf> = roots.iter().filter(|p| p.is_dir()).cloned().collect();
     v.sort_by_key(|p| p.components().count());
     let mut kept: Vec<PathBuf> = Vec::new();
     for r in v {
-        if kept.iter().any(|k| root_covered(k.as_path(), &r)) {
+        if kept.iter().any(|k| root_covered(k.as_path(), &r, opts)) {
             continue;
         }
         kept.push(r);
@@ -622,7 +702,7 @@ pub fn prepare_roots(roots: &[PathBuf]) -> Vec<PathBuf> {
     kept
 }
 
-fn root_covered(ancestor: &Path, child: &Path) -> bool {
+fn root_covered(ancestor: &Path, child: &Path, opts: &IndexOptions) -> bool {
     let Ok(rel) = child.strip_prefix(ancestor) else {
         return false;
     };
@@ -630,15 +710,16 @@ fn root_covered(ancestor: &Path, child: &Path) -> bool {
         return false;
     }
     let comps: Vec<_> = rel.components().collect();
-    // walk_into_depth stops after 10. A deep extra root is not covered.
-    if comps.is_empty() || comps.len() > 8 {
+    // The ancestor walk stops after `max_depth`. A deeper extra root is not covered.
+    if comps.is_empty() || comps.len() >= opts.max_depth as usize {
         return false;
     }
     for c in &comps {
-        if let Some(name) = c.as_os_str().to_str() {
-            if skip_dir(name) {
-                return false;
-            }
+        let Some(name) = c.as_os_str().to_str() else {
+            return false;
+        };
+        if dir_excluded(name, &opts.skip_dirs) || (!opts.index_dotfiles && name.starts_with('.')) {
+            return false;
         }
     }
     true
@@ -646,23 +727,28 @@ fn root_covered(ancestor: &Path, child: &Path) -> bool {
 
 /// Walk `roots` once and fill an index. Subsequent search does not walk.
 pub fn walk_roots(roots: &[PathBuf]) -> NameIndex {
+    walk_roots_with(roots, &IndexOptions::default())
+}
+
+/// Walk `roots` with explicit exclusions, dotfile policy, and depth.
+pub fn walk_roots_with(roots: &[PathBuf], opts: &IndexOptions) -> NameIndex {
     let mut idx = NameIndex::new();
-    for root in prepare_roots(roots) {
+    for root in prepare_roots_with(roots, opts) {
         if let Some(name) = root.file_name().and_then(|n| n.to_str()) {
             let modified = std::fs::metadata(&root).ok().as_ref().and_then(mtime_unix);
             idx.insert_meta(name, &root.to_string_lossy(), None, true, modified);
         }
-        walk_into(&mut idx, &root);
+        walk_into(&mut idx, &root, opts);
     }
     idx
 }
 
-fn walk_into(idx: &mut NameIndex, root: &Path) {
-    walk_into_depth(idx, root, 0);
+fn walk_into(idx: &mut NameIndex, root: &Path, opts: &IndexOptions) {
+    walk_into_depth(idx, root, 0, opts);
 }
 
-fn walk_into_depth(idx: &mut NameIndex, root: &Path, depth: u8) {
-    if depth > 10 {
+fn walk_into_depth(idx: &mut NameIndex, root: &Path, depth: u8, opts: &IndexOptions) {
+    if depth > opts.max_depth {
         return;
     }
     let walker = match std::fs::read_dir(root) {
@@ -675,17 +761,22 @@ fn walk_into_depth(idx: &mut NameIndex, root: &Path, depth: u8) {
         if name == "." || name == ".." {
             continue;
         }
+        if !opts.index_dotfiles && name.starts_with('.') {
+            continue;
+        }
         let meta = ent.metadata().ok();
         let is_dir = meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
         let modified = meta.as_ref().and_then(mtime_unix);
         let size = meta.and_then(|m| if is_dir { None } else { Some(m.len()) });
         idx.insert_meta(&name, &path.to_string_lossy(), size, is_dir, modified);
-        if is_dir && !skip_dir(&name) {
-            walk_into_depth(idx, &path, depth + 1);
+        if is_dir && !dir_excluded(&name, &opts.skip_dirs) {
+            walk_into_depth(idx, &path, depth + 1, opts);
         }
     }
 }
 
+/// Directory names the program scanner does not enter (vendor trees and build
+/// output). File search does not use this list; it uses [`IndexOptions`].
 pub fn skip_dir(name: &str) -> bool {
     matches!(
         name,
@@ -1042,5 +1133,167 @@ mod tests {
             hits.iter().find(|h| h.name == "WindowsTerminal.exe").unwrap().modified,
             Some(1_700_000_100)
         );
+    }
+
+    fn norm_path(p: &str) -> String {
+        p.replace('\\', "/").to_ascii_lowercase()
+    }
+
+    fn scratch_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "katana-idx-{name}-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Project tree the owner searches: css beside the crate, the binary under
+    /// `target/release`, a dotfile, a dependency dir, and a file deeper than the
+    /// old hard-coded walk cap.
+    fn kestrel_tree() -> std::path::PathBuf {
+        let root = scratch_dir("kestrel");
+        let proj = root.join("kestrel");
+        fs::create_dir_all(proj.join("target").join("release")).unwrap();
+        fs::create_dir_all(proj.join("node_modules")).unwrap();
+        fs::write(root.join("kestrel.css"), b"body{}").unwrap();
+        fs::write(root.join("tool.exe"), b"MZ").unwrap();
+        fs::write(proj.join("kestrel.css"), b"body{}").unwrap();
+        fs::write(proj.join(".envrc"), b"export X=1").unwrap();
+        fs::write(proj.join("node_modules").join("left.js"), b"module").unwrap();
+        fs::create_dir_all(proj.join("keep-out")).unwrap();
+        fs::write(proj.join("keep-out").join("secret.txt"), b"no").unwrap();
+        fs::write(
+            proj.join("target").join("release").join("kestrel.exe"),
+            b"MZ",
+        )
+        .unwrap();
+        let mut deep = root.join("deep");
+        for i in 0..16 {
+            deep.push(format!("d{i}"));
+        }
+        fs::create_dir_all(&deep).unwrap();
+        fs::write(deep.join("deep.txt"), b"deep").unwrap();
+        root
+    }
+
+    #[test]
+    fn extension_query_ranks_exact_filename_when_present() {
+        let mut idx = NameIndex::new();
+        idx.insert("kestrel", r"C:\Users\rajiv\dev\kestrel");
+        idx.insert("kestrel.css", r"C:\Users\rajiv\dev\kestrel\kestrel.css");
+        idx.insert(
+            "kestrel.exe",
+            r"C:\Users\rajiv\dev\kestrel\target\release\kestrel.exe",
+        );
+        let hits = idx.search("kestrel.exe", 8);
+        assert!(
+            hits.iter().any(|h| h.name == "kestrel.exe"),
+            "a dot in the query must not drop an exact filename: {hits:?}"
+        );
+        assert_eq!(hits[0].name, "kestrel.exe");
+        assert_eq!(hits[0].score, 1.0);
+    }
+
+    #[test]
+    fn indexed_root_search_finds_every_file_including_exe() {
+        let root = kestrel_tree();
+        let idx = walk_roots(std::slice::from_ref(&root));
+        let exe = idx.search("kestrel.exe", 16);
+        assert!(
+            exe.iter().any(|h| {
+                h.name == "kestrel.exe" && norm_path(&h.path).contains("target/release/kestrel.exe")
+            }),
+            "target/release/kestrel.exe must be findable under an indexed root: {exe:?}"
+        );
+        assert!(
+            idx.search("tool.exe", 8).iter().any(|h| h.name == "tool.exe"),
+            "an .exe next to other files must be indexed"
+        );
+        assert!(
+            idx.search("kestrel.css", 8)
+                .iter()
+                .any(|h| h.name == "kestrel.css")
+        );
+        assert!(
+            idx.search(".envrc", 8).iter().any(|h| h.name == ".envrc"),
+            "dotfiles are indexed unless settings turn them off"
+        );
+        assert!(
+            idx.search("deep.txt", 8).iter().any(|h| h.name == "deep.txt"),
+            "a file nested past the old depth cap must still be indexed"
+        );
+        assert!(
+            idx.search("left.js", 8)
+                .iter()
+                .all(|h| !h.path.contains("node_modules")),
+            "node_modules stays out only as a documented default exclusion"
+        );
+        assert!(
+            idx.search("secret.txt", 8).iter().any(|h| h.name == "secret.txt"),
+            "a directory absent from the skip list must be indexed"
+        );
+        assert_eq!(exe[0].name, "kestrel.exe");
+        assert_eq!(exe[0].score, 1.0);
+        let defaults = default_index_skip_dirs();
+        assert!(defaults.iter().any(|s| s == "node_modules"));
+        assert!(
+            !defaults.iter().any(|s| s.eq_ignore_ascii_case("target")),
+            "build output is not a default exclusion"
+        );
+        assert!(!defaults.iter().any(|s| s.eq_ignore_ascii_case("dist")));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn exclusions_happen_only_when_options_say_so() {
+        let root = kestrel_tree();
+        let open = IndexOptions {
+            skip_dirs: Vec::new(),
+            index_dotfiles: true,
+            max_depth: DEFAULT_INDEX_MAX_DEPTH,
+        };
+        let all = walk_roots_with(std::slice::from_ref(&root), &open);
+        assert!(
+            all.search("left.js", 8).iter().any(|h| h.name == "left.js"),
+            "empty skip list indexes node_modules: {:?}",
+            all.search("left.js", 4)
+        );
+        assert!(all.search("kestrel.exe", 8).iter().any(|h| h.name == "kestrel.exe"));
+        assert!(all.search(".envrc", 8).iter().any(|h| h.name == ".envrc"));
+        assert!(all.search("secret.txt", 8).iter().any(|h| h.name == "secret.txt"));
+
+        let closed = IndexOptions {
+            skip_dirs: vec!["keep-out".into(), "Node_Modules".into()],
+            index_dotfiles: false,
+            max_depth: DEFAULT_INDEX_MAX_DEPTH,
+        };
+        let idx = walk_roots_with(std::slice::from_ref(&root), &closed);
+        assert!(
+            idx.search("secret.txt", 8).is_empty(),
+            "keep-out is excluded only because options list it"
+        );
+        assert!(
+            idx.search("left.js", 8)
+                .iter()
+                .all(|h| !norm_path(&h.path).contains("node_modules")),
+            "skip names are case-insensitive"
+        );
+        assert!(
+            idx.search(".envrc", 8).is_empty(),
+            "dotfiles stay out when index_dotfiles is false"
+        );
+        let exe = idx.search("kestrel.exe", 8);
+        assert!(
+            exe.iter().any(|h| {
+                h.name == "kestrel.exe" && norm_path(&h.path).contains("target/release/kestrel.exe")
+            }),
+            "target is not skipped unless the list says so: {exe:?}"
+        );
+        assert!(idx.search("tool.exe", 4).iter().any(|h| h.name == "tool.exe"));
+        let _ = fs::remove_dir_all(root);
     }
 }

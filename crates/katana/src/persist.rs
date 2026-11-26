@@ -152,6 +152,18 @@ pub struct Settings {
     /// Extra folders to walk for Explorer-style file search (name/size/type).
     #[serde(default)]
     pub crawl_folders: Vec<String>,
+    /// Directory names `/f` does not enter. Missing from config uses
+    /// [`katana_index::default_index_skip_dirs`]. An explicit empty list walks
+    /// every directory. `target` is not a default, so `target/release/*.exe`
+    /// under an indexed root is searchable. Extensions are never filtered.
+    #[serde(default = "default_index_skip_dirs")]
+    pub index_skip_dirs: Vec<String>,
+    /// Index file and folder names that start with `.`.
+    #[serde(default = "default_true")]
+    pub index_dotfiles: bool,
+    /// How many directory levels under each index root `/f` walks (clamped 1–64).
+    #[serde(default = "default_index_max_depth")]
+    pub index_max_depth: u8,
     /// Max clipboard history items. Oldest unpinned clips are dropped.
     #[serde(default = "default_clip_history_limit")]
     pub clip_history_limit: usize,
@@ -242,6 +254,18 @@ fn default_true() -> bool {
     true
 }
 
+fn default_index_skip_dirs() -> Vec<String> {
+    katana_index::default_index_skip_dirs()
+}
+
+fn default_index_max_depth() -> u8 {
+    katana_index::DEFAULT_INDEX_MAX_DEPTH
+}
+
+pub fn clamp_index_max_depth(n: u8) -> u8 {
+    n.clamp(1, 64)
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -251,6 +275,9 @@ impl Default for Settings {
             autostart: false,
             save_shots: true,
             crawl_folders: Vec::new(),
+            index_skip_dirs: default_index_skip_dirs(),
+            index_dotfiles: true,
+            index_max_depth: default_index_max_depth(),
             clip_history_limit: default_clip_history_limit(),
             last_keyword: String::new(),
         }
@@ -282,6 +309,13 @@ impl Settings {
         };
         let mut s: Self = toml::from_str(&raw).unwrap_or_default();
         s.clip_history_limit = clamp_clip_history_limit(s.clip_history_limit);
+        s.index_max_depth = clamp_index_max_depth(s.index_max_depth);
+        s.index_skip_dirs = s
+            .index_skip_dirs
+            .into_iter()
+            .map(|d| d.trim().to_string())
+            .filter(|d| !d.is_empty())
+            .collect();
         s
     }
 
@@ -540,6 +574,9 @@ mod tests {
             autostart: true,
             save_shots: true,
             crawl_folders: vec![r"C:\src".into()],
+            index_skip_dirs: katana_index::default_index_skip_dirs(),
+            index_dotfiles: true,
+            index_max_depth: katana_index::DEFAULT_INDEX_MAX_DEPTH,
             clip_history_limit: 50,
             last_keyword: "g".into(),
         };
@@ -559,6 +596,43 @@ mod tests {
         assert!(Settings::default().save_shots);
         assert_eq!(Settings::load(&p).clip_history_limit, 100);
         assert!(Settings::load(&p).last_keyword.is_empty());
+        let defaults = Settings::load(&p);
+        assert!(defaults.index_dotfiles);
+        assert_eq!(defaults.index_max_depth, katana_index::DEFAULT_INDEX_MAX_DEPTH);
+        assert!(defaults.index_skip_dirs.iter().any(|d| d == "node_modules"));
+        assert!(!defaults
+            .index_skip_dirs
+            .iter()
+            .any(|d| d.eq_ignore_ascii_case("target")));
+    }
+
+    #[test]
+    fn index_skip_list_can_be_cleared_or_clamped() {
+        let dir = tmp("idx-cfg");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        fs::write(
+            &path,
+            "index_skip_dirs = []\nindex_dotfiles = false\nindex_max_depth = 0\n",
+        )
+        .unwrap();
+        let s = Settings::load(&path);
+        assert!(
+            s.index_skip_dirs.is_empty(),
+            "explicit empty list is not the defaults"
+        );
+        assert!(!s.index_dotfiles);
+        assert_eq!(s.index_max_depth, 1);
+        fs::write(
+            &path,
+            "index_max_depth = 200\nindex_skip_dirs = [\" keep-out \", \"\"]\n",
+        )
+        .unwrap();
+        let s = Settings::load(&path);
+        assert_eq!(s.index_max_depth, 64);
+        assert_eq!(s.index_skip_dirs, vec!["keep-out".to_string()]);
+        assert!(s.index_dotfiles, "missing index_dotfiles stays on");
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

@@ -1314,6 +1314,10 @@ fn folder_hit(name: &str, path: &std::path::Path, score: f32) -> Hit {
 
 pub fn crawl_roots() -> Vec<std::path::PathBuf> {
     let s = crate::persist::Settings::load(&crate::persist::settings_path());
+    crawl_roots_from(&s)
+}
+
+fn crawl_roots_from(s: &crate::persist::Settings) -> Vec<std::path::PathBuf> {
     let mut roots = default_user_roots();
     for p in &s.crawl_folders {
         let pb = std::path::PathBuf::from(p.trim());
@@ -1327,9 +1331,18 @@ pub fn crawl_roots() -> Vec<std::path::PathBuf> {
     roots
 }
 
+fn index_options_from(s: &crate::persist::Settings) -> katana_index::IndexOptions {
+    katana_index::IndexOptions {
+        skip_dirs: s.index_skip_dirs.clone(),
+        index_dotfiles: s.index_dotfiles,
+        max_depth: s.index_max_depth,
+    }
+}
+
 fn user_file_index() -> katana_index::NameIndex {
+    let settings = crate::persist::Settings::load(&crate::persist::settings_path());
     let roots = crawl_roots();
-    let mut idx = katana_index::build_live_index(&roots);
+    let mut idx = katana_index::build_live_index_with(&roots, &index_options_from(&settings));
     for (name, path) in well_known_user_folders() {
         let modified = std::fs::metadata(&path)
             .ok()
@@ -2079,5 +2092,23 @@ mod tests {
         assert!(l.hits.iter().all(|h| !is_recent_hit(h)));
         l.handle_tab(false);
         assert_eq!(l.query, "youtube ");
+    }
+
+    #[test]
+    fn file_index_options_follow_settings() {
+        let mut s = crate::persist::Settings::default();
+        assert!(
+            !s.index_skip_dirs
+                .iter()
+                .any(|d| d.eq_ignore_ascii_case("target")),
+            "default settings must not hide target/"
+        );
+        s.index_skip_dirs = vec!["Keep-Out".into()];
+        s.index_dotfiles = false;
+        s.index_max_depth = 7;
+        let opts = super::index_options_from(&s);
+        assert_eq!(opts.skip_dirs, vec!["Keep-Out".to_string()]);
+        assert!(!opts.index_dotfiles);
+        assert_eq!(opts.max_depth, 7);
     }
 }
