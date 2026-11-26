@@ -4,8 +4,7 @@
   <img src="icon.jpg" width="720" alt="Katana">
 </p>
 
-<p align="center"><strong>A Japanese swiss knife for Windows.</strong><br>
-Fast. Small. Many-talented.</p>
+<p align="center"><strong>A lightweight Alfred for Windows: app launcher, file search, screenshots, screen recording, clipboard history and keyword shortcuts.</strong></p>
 
 Katana lives in the tray. Press **Alt+Space** and it is in your hands — one thin prompt, many blades. No webview, one process, a couple of megabytes. **Win+Alt+C** opens clipboard history; **Win+Alt+Space** opens file search. **Ctrl+Alt+R** toggles screen recording.
 
@@ -37,7 +36,7 @@ rec_output_dir = ""         # empty → %USERPROFILE%\Videos\Katana
 
 ## Download
 
-**[Katana 0.3.8 for Windows](https://github.com/rajmenon/katana/releases/latest)** — `Katana-0.3.8-windows-x86_64.exe` (~2.8 MB). Run it; it stays in the tray. **Alt+Space** opens the prompt.
+**[Katana 0.3.9 for Windows](https://github.com/rajmenon/katana/releases/latest)** — `Katana-0.3.9-windows-x86_64.exe` (~2.9 MB). Run it; it stays in the tray. **Alt+Space** opens the prompt.
 
 ## Run
 

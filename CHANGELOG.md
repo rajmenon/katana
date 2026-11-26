@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.9 — 2026-11-26
 
 ### Screen recording (`/rec`)
 - `/rec` lists Record full screen, Record region, and Stop recording. **Ctrl+Alt+R** toggles full-screen recording (`rec_hotkey`)
@@ -9,6 +9,10 @@
 - A thin red border outlines the recorded region, just outside the captured pixels (on the monitor edge for full screen). The border is click-through, and both it and the dot are excluded from the capture
 - Saves `%USERPROFILE%\Videos\Katana\Katana-YYYYMMDD-HHMMSS.mp4`, then a toast plus Open file and Open folder rows
 - System audio (WASAPI loopback) and the default microphone are off unless `rec_audio_system` / `rec_audio_mic` are set. `rec_fps` defaults to 30 (clamped to 1–60). `rec_output_dir` overrides the folder
+- One monitor at a time. The mouse cursor is not drawn into the video
+
+### Launch
+- Fix: running commands like `>powershell` no longer freezes Katana. The command runs on its own thread. Console programs get their own console; GUI programs are detached. A missing program stays in the overlay as an error row
 
 ## 0.3.8 — 2026-11-26
 
