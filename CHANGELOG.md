@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### Files (`/f`)
+- File search indexes every file under each configured folder, including `.exe` and `target\release` build output. Extensions are not a filter
+- Skipped directories come from `index_skip_dirs` in `%APPDATA%\Katana\config.toml`. The defaults still skip `node_modules` and `.git`, and no longer skip `target` or `dist`
+- `index_dotfiles` (default true) and `index_max_depth` (default 24, clamped 1–64) control dotfiles and walk depth. An explicit empty skip list walks every directory name
+- A query like `kestrel.exe` ranks the exact filename above a folder or `kestrel.css` that only matches the stem
+
 ## 0.3.7 — 2026-11-25
 
 ### Recents

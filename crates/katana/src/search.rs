@@ -1244,4 +1244,45 @@ mod tests {
         assert!(empty.iter().any(|h| h.kind == HitKind::App));
         assert!(empty.iter().any(|h| h.id == "cmd:/shortcuts-edit" || h.kind == HitKind::Keyword));
     }
+
+    #[test]
+    fn file_route_finds_exe_under_indexed_folder() {
+        let root = std::env::temp_dir().join(format!(
+            "katana-f-exe-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let release = root.join("kestrel").join("target").join("release");
+        std::fs::create_dir_all(&release).unwrap();
+        std::fs::write(root.join("kestrel").join("kestrel.css"), b"body{}").unwrap();
+        std::fs::write(release.join("kestrel.exe"), b"MZ").unwrap();
+        let idx = katana_index::walk_roots(std::slice::from_ref(&root));
+        let e = Engine::new(Vec::new(), idx);
+        let (route, hits) = e.search("/f kestrel.exe", None, None, 16);
+        assert!(matches!(route, Route::Files { .. }));
+        for h in &hits {
+            eprintln!(
+                "/f kestrel.exe -> {:<14} {:<14} {}",
+                h.title,
+                h.type_name.as_deref().unwrap_or(""),
+                launch_path(h).unwrap_or_default()
+            );
+        }
+        let exe = hits.iter().find(|h| h.title == "kestrel.exe");
+        assert!(
+            exe.is_some(),
+            "/f kestrel.exe must list the binary, not only the folder and css: {hits:?}"
+        );
+        let path = launch_path(exe.unwrap()).unwrap();
+        assert!(
+            path.replace('\\', "/")
+                .to_ascii_lowercase()
+                .contains("target/release/kestrel.exe"),
+            "{path}"
+        );
+        assert!((exe.unwrap().score - 1.0).abs() < 0.001, "exact filename ranks first-class");
+        let _ = std::fs::remove_dir_all(root);
+    }
 }
