@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.8 — 2026-11-26
 
 ### Files (`/f`)
 - File search indexes every file under each configured folder, including `.exe` and `target\release` build output. Extensions are not a filter
