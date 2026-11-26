@@ -83,6 +83,7 @@ mod win {
     const HOT_FILES: i32 = 7;
     const TRAY_CB: u32 = 0x8001;
     const WM_WAKE: u32 = 0x8002;
+    const WM_SHELL_DONE: u32 = 0x8003;
     const MENU_SHOW: usize = 1001;
     const MENU_QUIT: usize = 1002;
     const MENU_KW: usize = 1003;
@@ -159,6 +160,14 @@ mod win {
         match msg {
             m if m == WM_WAKE => {
                 show(hwnd);
+                LRESULT(0)
+            }
+            m if m == WM_SHELL_DONE => {
+                let ptr = l.0 as *mut ShellDone;
+                if !ptr.is_null() {
+                    let done = Box::from_raw(ptr);
+                    finish_shell_message(hwnd, done.cmdline, done.result);
+                }
                 LRESULT(0)
             }
             WM_PAINT => {
@@ -970,17 +979,88 @@ mod win {
                 refresh_tray_tip(hwnd);
                 relayout(hwnd);
             }
-            Outcome::CmdFailed { exit, cmdline } => {
+            Outcome::CmdFailed { message } => {
                 blink_fail(hwnd);
-                tray_info(
-                    hwnd,
-                    "Command failed",
-                    &crate::exec::cmd_failed_label(exit, &cmdline),
-                );
+                tray_info(hwnd, "Command failed", &message);
                 relayout(hwnd);
+            }
+            Outcome::PendingShell { cmdline, admin } => {
+                // Return to the message loop. The spawn thread posts WM_SHELL_DONE.
+                begin_shell(hwnd, cmdline, admin);
             }
         }
         Ok(())
+    }
+
+    struct ShellDone {
+        cmdline: String,
+        result: Result<(), String>,
+    }
+
+    fn begin_shell(hwnd: HWND, cmdline: String, admin: bool) {
+        if admin {
+            let result = crate::exec::spawn_shell_here(&cmdline, true);
+            finish_shell_message(hwnd, cmdline, result);
+            return;
+        }
+        let hwnd_bits = hwnd.0 as isize;
+        let cmd_for_err = cmdline.clone();
+        let spawned = std::thread::Builder::new()
+            .name("katana-spawn".into())
+            .spawn(move || {
+                let result = crate::exec::spawn_shell_here(&cmdline, false);
+                let done = Box::new(ShellDone { cmdline, result });
+                let raw = Box::into_raw(done);
+                let posted = unsafe {
+                    PostMessageW(
+                        HWND(hwnd_bits as *mut _),
+                        WM_SHELL_DONE,
+                        WPARAM(0),
+                        LPARAM(raw as isize),
+                    )
+                };
+                if posted.is_err() {
+                    drop(unsafe { Box::from_raw(raw) });
+                }
+            });
+        if spawned.is_err() {
+            finish_shell_message(
+                hwnd,
+                cmd_for_err,
+                Err("couldn't start the launcher thread".into()),
+            );
+        }
+    }
+
+    fn finish_shell_message(hwnd: HWND, cmdline: String, result: Result<(), String>) {
+        let outcome = {
+            let Ok(mut g) = STATE.lock() else {
+                return;
+            };
+            let Some(ln) = g.as_mut() else {
+                return;
+            };
+            ln.settle_shell(&cmdline, result, true)
+        };
+        match outcome {
+            Outcome::Ran(_) => hide(hwnd),
+            Outcome::CmdFailed { message } => {
+                let row = STATE
+                    .lock()
+                    .ok()
+                    .and_then(|g| {
+                        g.as_ref()
+                            .and_then(|ln| ln.hits.first().map(|h| h.id == "err:shell"))
+                    })
+                    .unwrap_or(false);
+                tray_info(hwnd, "Command failed", &message);
+                if row {
+                    blink_fail(hwnd);
+                    relayout(hwnd);
+                }
+            }
+            _ => {}
+        }
     }
 
     fn blink_fail(hwnd: HWND) {
